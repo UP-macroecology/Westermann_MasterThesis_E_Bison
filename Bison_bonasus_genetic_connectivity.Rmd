@@ -8,7 +8,7 @@ output:
 editor_options:
   chunk_output_type: console
 ---
-This script is for my research of my Master thesis. ADD MORE DESCRIPTIVE TEXT
+This is the main script is for my research of my Master thesis. 
 # Load libraries
 ```{r setup}
 library(RangeShiftR)
@@ -931,6 +931,7 @@ summary(lm_dev_A)
 
 
 # Genetic connectivity/similarity
+Genetic connectivity (expressed through Nei's genetic similarity index) was calculated for each model/scenario seperately (Gen_analysis_sXX.R). In these scripts I saved the desired output (sXX_gen_sim_df20.RData (first output year) and sXX_gen_sim_df210.RData (last output year))
 ## Preparations
 ```{r}
 ##### Base-model (s9) #####
