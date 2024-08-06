@@ -11,3 +11,4 @@ The main script is "Bison_bonasus_genetic_connectivity.Rmd". In this script I cr
   - For allelic diversity, genetic connectivity, abundance and occupancy probability relative values were calculated to compare across scenarios.
   - The script finishes by producing some descriptive statistics for all important measurements  
   
+For the base model, a sensitivity analysis was carried out "Sensitivity_analysis.Rmd". Which parameters were altered and by how much can be found at the top of the script.
