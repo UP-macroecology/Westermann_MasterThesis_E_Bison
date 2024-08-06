@@ -16,6 +16,7 @@ Alternative_basemodels.txt
 Alternative_Modules.txt
 Calculate_euclidean distance.R
 Gen_analysis_s77.sh
+initial_population.R
 network_code.txt
 README.md
 Rplots.pdf
@@ -23,6 +24,6 @@ Run_bison_models.R
 Run_gen_analysis.sh
 Sensitivity_analysis.R
 Sensitivity_analysis_1.R
-Test_corridors.R
+Translocation_sequence.R
 Translocation_test_Jette.Rmd
 Veränderungen vorgenommen am Skript.docx

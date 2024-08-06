@@ -721,24 +721,7 @@ ggplot(Allelic_div_combined, aes(x = Year, y = A, colour = Patch_Name)) +
         plot.title = element_text(size = 30, face = "bold")) +
   facet_wrap(~Scenario) +
   ggtitle("Allelic diversity in individual populations over time")
-#ggsave(filename = "Plots/Allelic_div_over_time_ind_populations.png")
-# Maybe exclude Rothaar?
-# Overall (not per population) WITHOUT Rothaar
-#ggplot(Allelic_div_combined[Allelic_div_combined$Patch_Name != "Rothaar",], aes(x = Year, y = A)) +
- # geom_smooth(method = "lm") +
-  #labs(title = "Allelic Diversity Over Time") +
-  #theme_minimal() +
-  #facet_wrap(~Source) +
-  #ggtitle("Allelic diversity across all populations over time (excluding Rothaar)")
 
-#ggplot(Allelic_div_combined[Allelic_div_combined$Patch_Name != "Rothaar",], aes(x = Year, y = A, colour = Patch_Name)) +
- # geom_smooth(method = "lm") +
-  #labs(title = "Allelic Diversity Over Time") +
-  #theme_minimal() +
-  #facet_wrap(~Source) +
-  #ggtitle("Allelic diversity in individual populations over time (excluding Rothaar)")
-
-#### Relative change in A ####
 #### Calculate relative A ####
 Allelic_div_combined_relative <- Allelic_div_combined %>%
   group_by(Scenario, PatchID) %>%
