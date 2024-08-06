@@ -1,0 +1,2467 @@
+---
+title: "Bison_bonasus_genetic_connectivity"
+author: "Tim Westermann"
+date: "2024-01-09"
+output:
+  word_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: console
+---
+This script is for my research of my Master thesis. ADD MORE DESCRIPTIVE TEXT
+# Load libraries
+```{r setup}
+library(RangeShiftR)
+library(tictoc)
+#library(latticeExtra)
+#library(rgdal)
+library(RColorBrewer)
+library(rasterVis)
+library(viridis)
+library(gridExtra)
+#library(rgeos)
+library(raster)
+#library(dplyr)
+library(terra)
+#library(tidyr)
+library(poppr) # includes package adegenet needed for dist.genpop()
+library(purrr)
+library(tidyverse) #includes reshape2
+library(assertthat)
+library(igraph)
+library(ggplot2)
+library(ggraph)
+library(ggmap)
+library(data.table)
+library(ggpubr)
+dirpath <- paste0("")
+```
+
+# Landscape settings
+```{r}
+model_number_pre <- 1
+#convert number to 3-digit string used for the folder
+model_number <- sprintf("%03d", model_number_pre)
+
+## load landscape files here to use in simulation as well as for mapping of results later on
+habitat <- raster("Inputs/Habitat.asc")
+#writeRaster(habitat, filename = "Inputs/habitat.txt", format = "ascii", overwrite = T)
+# Wildlife Corridors
+Corridors<-raster("Corridors/data/Wildlife_Corridors.tif")
+# Movement costs
+disp_cost <- raster("Inputs/disp_costs.asc")
+# As urban areas are not part of the movement cost matrix/map, I have to give these NAs a proper value in order for the dynamic landscape to work. As these areas were meant to be insurmountable I now set the value to one million. I tested it with 10k, 100k, 1mio and 1bil(billion). Rising the value to 1mio changed the abundance and occupancy outcome slightly, however increasing further to 1bil did not bring any further change. Therefore I decided that a cost value of 1mio will be well suited to represent insurmountable areas within the landscape
+
+#disp_cost[is.na(disp_cost) & !is.na(habitat)] <- 1000000 ## did that with the older cost layer from hendrik
+#writeRaster(disp_cost, filename = "Inputs/disp_costs.txt", format = "ascii", overwrite = T)
+
+# Now for the ecoduct scenario cost file
+ecoduct_disp_cost <- raster("Inputs/disp_costs_ecoducts.asc")
+ecoduct_disp_cost[is.na(ecoduct_disp_cost) & !is.na(habitat)] <- 1000000 ## did that with the older cost layer from hendrik
+writeRaster(ecoduct_disp_cost, filename = "Inputs/disp_costs_ecoducts.txt", format = "ascii", overwrite = T)
+# Plot corridors ontop of the cost map
+plot(disp_cost)
+plot(Corridors,col = "deeppink", add=T, legend = F) # looks good, corridors appear where they should be
+# Now alter the values in the movement-costs-layer in every cell that is covered with a wildlife corridor 
+disp_cost_corridors<-disp_cost
+disp_cost_corridors[Corridors==1] <- 15
+writeRaster(disp_cost_corridors, filename = "Inputs/disp_costs_corridors.txt", format = "ascii", overwrite = T) # check in QGIS if altered properly
+
+# Patch map
+patches <- raster("Inputs/patches.asc")
+plot(patches)
+#writeRaster(patches, filename = "Inputs/patches.txt", format = "ascii", overwrite = T)
+## Here I subset "patches" to only contain currently occupied patches (and the landscape itself) for the spin up period
+# First create patches_spin from patches
+patches_spin <- patches
+# Which population has which patch ID?
+# I must load in the patch file as a SpatRaster using the terra package to get patch IDs quickly. I don't want to overwrite "patches" so i load it in as "patches2"
+patches2 <- terra::rast("Inputs/patches.asc")
+plot(patches2)
+patches_pol <- as.polygons(patches2, dissolve=T) # Makes spatial polygons
+text(patches_pol,labels=values(patches_pol)[,1])
+# Now I define the values I want to keep
+#patches_to_keep <- c(NA, 0, 2, 4, 6, 15, 22, 23, 24, 73, 83, 109)  # Including NA and 0 (general landscape)
+patches_to_keep <- c(4, 6, 15, 23, 109, 22, 24, 83, 2, 73, 0, NA)
+# Subset
+patches_spin[!(patches_spin %in% patches_to_keep)] <- 0
+plot(patches_spin) # looks good
+patches2[!(patches2 %in% patches_to_keep)] <- 0
+patches_pol <- as.polygons(patches2, dissolve=T) # Makes spatial polygons
+plot(patches2)
+text(patches_pol,labels=values(patches_pol)[,1])
+# Save the subsetted raster layer to a new ascii file. I will then have to manually resave it to .txt file for further use!
+writeRaster(patches_spin, filename = "Inputs/patches_spin.txt", format = "ascii", overwrite = T)
+
+# Transform "patches" to SpatRaster
+#patches <- as(patches, "SpatRaster") ## VERY IMPORTANT FOR GGPLOT LATER ON WHEN PLOTTING GENETIC DISTANCE, otherwise the structure of patch numbering will be lost and populations will be in places where they shouldn't be 
+#patches_pol <- as.polygons(patches, dissolve = T)
+
+#### Build landscape modules for Baseline, Corridor & Ecoduct Scenario ####
+# Define"patchFilename"
+patchFilename <- c("patches_spin.asc", "patches.asc")
+# Define "landFilename" (must have the same number of entries as patch)
+landFilename <- c("Habitat.asc", "Habitat.asc") 
+# Redefine "costsFilename" (must have same number of entries as patch and landscape)
+costsFilename <- c("disp_costs.asc", "disp_costs.asc")
+
+land <- ImportedLandscape(LandscapeFile = landFilename, 
+                          Resolution = 1000, # cell size in meters
+                          HabPercent = T, # T = continuos values expected (0.0 - 100.0); represent % of habitat cover or quality
+                          K_or_DensDep = 0.01, # (Krasinska & Krasinski, 2013)
+                          PatchFile = patchFilename,
+                          DynamicLandYears = c(0, 20), # Define in which simulation year the patch maps should be loaded --> Spin up
+                          CostsFile = costsFilename)
+## Wildlife Corridor Scenario
+CorridorCostsFilename <- c("disp_costs.asc", "disp_costs_corridors.asc")
+land2 <- ImportedLandscape(LandscapeFile = landFilename, 
+                          Resolution = 1000, # cell size in meters
+                          HabPercent = T, # T = continuos values expected (0.0 - 100.0); represent % of habitat cover or quality
+                          K_or_DensDep = 0.01, # (Krasinska & Krasinski, 2013)
+                          PatchFile = patchFilename,
+                          DynamicLandYears = c(0, 20), # Define in which simulation year the patch maps should be loaded --> Spin up
+                          CostsFile = CorridorCostsFilename)
+
+## Ecoduct scenario
+EcoductCostsFilename <- c("disp_costs.asc","disp_costs_ecoducts.asc")
+land3 <- ImportedLandscape(LandscapeFile = landFilename, 
+                          Resolution = 1000, # cell size in meters
+                          HabPercent = T, # T = continuos values expected (0.0 - 100.0); represent % of habitat cover or quality
+                          K_or_DensDep = 0.01, # (Krasinska & Krasinski, 2013)
+                          PatchFile = patchFilename,
+                          DynamicLandYears = c(0, 20), # Define in which simulation year the patch maps should be loaded --> Spin up
+                          CostsFile = EcoductCostsFilename)
+```
+
+# Demography settings
+To make it as realistic as possible, set ReproductionType to 2 (explicit system) with an adequat harem size.
+```{r}
+# The Demography module contains all the local population dynamics of your simulated species. I use a Stage-structured model / overlapping generations
+# 4 stages: calves, adolescents, reproductive adults, senescent adults (Kümmerle et al., 2011; Krasinska & Krasinski, 2013)
+# Define the stage structure sub-module: containing fecundities, survival probabilities, and probabilities of developing to the next stage
+# Fecundities (i.e., number of (female) offspring per female per year)
+
+
+## Transition matrix
+# According to literature only ~50% of males participate in breeding. How could I take this into the model? in transition matrix males can only have 0 (non breeding) or 1 (breeding) in first row
+# Here I include an additional "pseudo" stage. Basically juveniles/subadults that do not disperse yet
+trans_mat2 <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for juvenile stage that only has one row for both sexes). First male, then female. 0.42 based on polish part of Bialowieza. In Belarussian part mean fecundity is 37.8% (0.378) (Krasinska & Krasinski, 2013)
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+# I calculated the male survival rates based on mortality rates given in Daleszczyk & Bunevich (2009). Survival_prob = 1 - mortality_rate / 100. Before calculating male survival prob., I did the same calculations with female values and received the same survival values as in Kuemmerle et al. (2011), which my female survival probabilities are based on
+# Krasinska & Krasinski (2013) state that a bisons survival probability increases with age
+
+## Stage structure
+stg3 <- StageStructure(Stages = 5, 
+                       TransMatrix = trans_mat2,
+                       PRep = 1, # PRep = Probability of reproducing in subsequent reproductive seasons. 
+                       # typically females give birth to a calf once every 2-3 years which is already included in the fecundity
+                       MaxAge = 25,
+                       MinAge = c(0, #calves(for both sexes)
+                                  0, #male juveniles
+                                  0, #female juveniles
+                                  2, # male adolescents
+                                  2, # female adolescents 
+                                  6, #male rep. adults from Krasinska & Krasinski (2013)
+                                  4, #female rep. adults from Krasinska & Krasinski (2013)
+                                  13, #male sen. adults (from Krasinska & Krasinski 2013)
+                                  20), #female sen. adults (Krasinska & Krasinski, 2013)
+                       SurvSched = 1,  ## 1=between reproductive events (as winter mortality main natural factor) (Krasinska & Krasinki, 2013)
+                       FecDensDep = T, # Coefficient is set in landscape module (K_or_DensDep)
+                       DevDensDep = F, 
+                       SurvDensDep = F)
+
+## Demography module
+demo3 <- Demography(StageStruct = stg3,
+                    ReproductionType = 2, # was 0 in Hendriks model, but as I will be including genetics, I have to change it to 1 or 2 (maybe more realistic?)
+                    Harem = 10, # Bison have a polygynous mating system (one bull may mate with many females)
+                    #groups/herds often consist of 10-12 individuals with 1 bull during the rut.
+                    PropMales = 0.5) # LITERATURE
+
+validateRSparams(demo)
+```
+
+# Genetics settings
+```{r}
+# In Hartway et al. (2020) paper, Allelic diversity under current management is predicted to decrease by 7.4%. I could not find ANYTHING on crossover probabilities that would give me a reference point for ProbCross so I think its wisest to leave it out (meaning its set to 0 by default)
+gen_mod <- Genetics(Architecture = 1, # 1 = read from file
+                    ArchFile = "genetic_architecture.txt",
+                    AlleleSD = 0.17 # This controls for the initial genetic variation, default is 0.1. I will have to play around with it to get an initital genetic variation that is close to reality (Olech et al., 2023: A = 2.7)
+                    )
+```
+
+# Dispersal settings
+```{r}
+#### Set values #### 
+# for the three dispersal scenarios
+## D0 = maximum emigration probability (i.e. basically share of respective age classes dispersing at K)
+D0_value_low <- 0.1
+D0_value_medium <- 0.25 
+D0_value_high <- 0.3
+
+# Beta_emig = inflection point of emigration probability curve - the lower this value the higher the dispersal activity! (or: already at lower pop densities individuals start dispersing)
+# low value here leads to a lot of dispersal happening initially from several populations (e.g., Bialowieza)
+Beta_emig_value_low <- 0.9 # Slope muss dann auf 20
+Beta_emig_value_medium <- 0.7 # Slope muss dann auf 15
+Beta_emig_value_high <- 0.5 # Slope muss dann auf 10
+
+## Assign which values to use
+D0_value <- D0_value_low
+Beta_emig_value <- Beta_emig_value_low
+
+# EmigProb = Matrix containing all parameters (#columns) to determine emigration probabilities for each stage/sex (#rows).
+# If DensDep=TRUE, the functional parameters D0 (max emigration prob), alpha (slope at inflection pt) and Beta (inflection pt) must be specified
+
+# Emigration: The first phase of dispersal; determines whether an individual leaves its natal patch.
+## Dispersal of males depends on availability of females while dispersal of females depends on availability of resources (Kowalczyk et al., 2013). Loe et al. (2009) found strong negative density dependence emigration rates in male red deer and argue that density dependence in dispersal rates may differ strongly in polygynous species (such as bison..) I TEST THIS IN EMIG_MAT2
+## Group size of bull is negatively correlated with age (Krasinska & Krasinski, 1995). Kowalczyk et al. (2013) argue this indicates that more younger bulls disperse.
+## stage, sex, max. emigration prob., 
+emig_mat2 <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value,20,Beta_emig_value, # female adolescents
+                     2,1,D0_value,-20,Beta_emig_value, # male
+                     3,0,D0_value,20,Beta_emig_value, # female reproductive adults
+                     3,1,D0_value,-20,Beta_emig_value, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+emigration_mod2 <- Emigration(EmigProb = emig_mat2, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+
+par(mfrow=c(1,2))
+#plotProbs(emigration_mod)
+#plotProbs(emigration_mod2)
+# Transfer: The second phase of dispersal; consists of the movement of an individual departing from its natal patch towards a potential new patch, ending with settlement or mortality.
+transfer_mod <- SMS(PR = 1, # perceptual range of each individual for decision about next step, in number of cells
+                    PRMethod = 3, # use 1 (arithmetic mean) or 3 (weighted arithmetic mean), 3 might be better in reflecting actual barrier value
+                    MemSize = 2,
+                    DP = 2.5, # with higher DP (directional persistence) values, more straight line movements would occur, which do happen, but then barriers might also be more simply transgressed!
+                    Costs = "file", # cost raster map specified in landscape module (values>=1)
+                    StraightenPath = FALSE)
+
+# Settlement: (or immigration) The last phase of dispersal; determines when the individual stops in a new cell or patch of breeding habitat
+sett_mat <-matrix(c(0,1,-10,0.5, # females #S0, αS, βS | S0 is the maximum settlement probability; αS is the slope at the inflection point; βS is the inflection point
+                    1,1,10,0.5), #males 
+                    nrow=2, byrow = T) 
+
+sett_mod <- Settlement(StageDep = FALSE,
+                       SexDep = TRUE,
+                       Settle = sett_mat,
+                       FindMate = c(FALSE, TRUE), # females settle independent of males, while males need a female (mate) to settle
+                       DensDep = TRUE, 
+                       MinSteps = c(0, 0),  # female | male
+                       MaxSteps = c(36, 2005),   # female MaxStep of 36 --> Max eucl. dispersal distance of 50.21km| male  MaxSteps=2005 --> max. eucl. distance = 359.13
+                       # I calculated the euclidean distance (in seperate R script) from the MovePaths output (from Rep0). As my resolution is set to 1000(m), I could simply take the calculated euclidean distance (which should be more or less the number of cells) as the km value and compare it to the desired values of 50km for females and 350km for males. Females move in straighter lines compared to males in my model (checked with movement paths). I believe this is because is set FindMate = TRUE for males, but FALSE for females (females settle independentely of males)
+                       MaxStepsYear = c(0, 0) # female | male
+                       )  
+
+
+par(mfrow=c(1,2))
+plotProbs(sett_mod)
+
+
+disp2 <- Dispersal(Emigration = emigration_mod2, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+```
+
+# Translocation sequence
+```{r}
+## In this chunk I define a sequence for source/receiving populations for my transloction scenario, so that source/receiving population are alternating
+##### Genetically least similar ######
+library(tidyverse)
+load("data/s9_gen_sim_df20.Rdata")
+load("data/s9_gen_sim_df210.Rdata")
+# Step 1: filter out only original populations
+gen_sim_y20_op <- gen_sim_df20_s9 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+# Step 2: order by ascending value of genetic similarity
+gen_sim_y20_op <- gen_sim_y20_op %>%
+  arrange(Avg_Gen_sim)
+# remove every other (duplicate) row
+gen_sim_y20_op <- gen_sim_y20_op[seq(1, nrow(gen_sim_y20_op), by = 2),]
+# save
+save(gen_sim_y20_op, file = "data/gen_sim_y20_op.RData")
+
+# Step 3: Generate a sequence of translocation pairs alternating between source and recipient populations
+# Get unique populations
+populations <- sort(unique(c(gen_sim_y20_op$Population1, gen_sim_y20_op$Population2)))
+
+genetic_similarity <- gen_sim_y20_op
+# Initialize source population sequence
+recipient_source_comb <- list()
+
+# Generate source population sequence for each recipient population
+for (pop in populations) {
+  # Filter genetic similarity data for the current recipient population as Population1 or Population2
+  pop_similarities <- subset(genetic_similarity, Population1 == pop | Population2 == pop)
+  
+  # Extract unique source populations
+  source_populations <- unique(c(pop_similarities$Population1, pop_similarities$Population2))
+  
+  # Remove the recipient population itself from the source populations
+  source_populations <- source_populations[source_populations != pop]
+  
+  # Ensure that each recipient has exactly 9 source populations
+  n_sources <- length(source_populations)
+  if (n_sources < 9) {
+    missing_sources <- populations[!populations %in% source_populations]
+    source_populations <- c(source_populations, missing_sources[1:(9 - n_sources)])
+  } else if (n_sources > 9) {
+    source_populations <- source_populations[1:9] # Limit to the first 9 source populations
+  }
+  
+  # Store the ordered source populations for the current recipient population
+  recipient_source_comb[[as.character(pop)]] <- source_populations
+}
+
+# Print the source population sequence
+for (pop in populations) {
+  cat("Recipient Population:", pop, "\n")
+  cat("Source Populations:", paste(recipient_source_comb[[as.character(pop)]], collapse = ","), "\n\n")
+}
+
+## Now transform the outcome into two strings: one for recipient and one for source
+# Recipient
+recipient_sequence <- character()
+# Repeat recipient population sequence 10 times each
+for (i in 1:9) {
+  # Append recipient population sequence
+  recipient_sequence <- c(recipient_sequence, populations)
+}
+
+# Source population
+# Convert the list of 10 lists into a continuous string
+source_sequence <- unlist(lapply(seq_along(recipient_source_comb[[1]]), function(i) {
+  paste(unlist(lapply(recipient_source_comb, function(x) x[i])), collapse = ",")
+}), use.names = FALSE)
+
+source_sequence <- paste(source_sequence, collapse = ",")
+length(unlist(strsplit(source_sequence, ",")))
+length(unlist(strsplit(recipient_sequence, ",")))
+recipient_sequence <- paste(recipient_sequence, collapse = ",")
+recipient_sequence
+source_sequence
+
+#---------------------------------------------------------------
+#### Exclude small populations (Rothaar, Romnicka, Janowski, Augustowska)
+
+# Initialize source population sequence
+recipient_source_comb2 <- list()
+
+# Generate source population sequence for each recipient population
+for (pop in populations) {
+  # Filter genetic similarity data for the current recipient population as Population1 or Population2
+  pop_similarities <- subset(genetic_similarity, Population1 == pop | Population2 == pop)
+  
+  # Extract unique source populations
+  source_populations <- unique(c(pop_similarities$Population1, pop_similarities$Population2))
+  
+  # Remove the populations to be excluded
+  source_populations <- source_populations[!source_populations %in% c(4, 83, 2, 73)]
+  
+  # Remove the recipient population itself from the source populations
+  source_populations <- source_populations[source_populations != pop]
+  
+  # Ensure that each recipient has exactly 9 source populations
+  n_sources <- length(source_populations)
+  if (n_sources < 5) {
+    missing_sources <- populations[!populations %in% source_populations]
+    source_populations <- c(source_populations, missing_sources[1:(5 - n_sources)])
+  } else if (n_sources > 5) {
+    source_populations <- source_populations[1:5] # Limit to the first 9 source populations
+  }
+  
+  # Store the ordered source populations for the current recipient population
+  recipient_source_comb2[[as.character(pop)]] <- source_populations
+}
+
+# Convert the list of 10 lists into a continuous string
+source_sequence2 <- unlist(lapply(seq_along(recipient_source_comb2[[1]]), function(i) {
+  paste(unlist(lapply(recipient_source_comb2, function(x) x[i])), collapse = ",")
+}), use.names = FALSE)
+
+# Combine into a single string separated by ","
+source_sequence2 <- paste(source_sequence2, collapse = ",")
+
+
+source_sequence2
+length(strsplit(source_sequence2, ",")[[1]])
+recipient_sequence
+length(strsplit(recipient_sequence, ",")[[1]])
+```
+
+# Translocations
+Here I build the translocation matrix for my translocation scenario (not used in other scenarios)
+```{r}
+# The matrix I built is based on an "alternating" translocation sequence. I calculated genetic similarity between populations in the first year after the spin-up period (y20). I then extracted the combination for receiving - source population from lowest to highest genetic similarity for each receiving population to the other population which would then function as source. At every translocation event, each herd receives new individuals but from alternating source herds in consecutive years. Once the sequence is fulfilled it starts anew until the end of the 200 years. 
+## Inspired by Hartway et al., (2020)
+#### 2 inds every 10 years ####
+## Here I alter the generated sequences to match the respective matrices for each translocation design
+# Split the source_sequence string by comma and convert it to numeric
+source_numbers <- as.numeric(strsplit(source_sequence, ",")[[1]])
+# Repeat each number twice
+doubled_source_numbers <- rep(source_numbers, each = 2)
+# Repeat the entire sequence to get at least 2000 elements
+source_pop <- rep(doubled_source_numbers, times = 12)
+
+# Split the recipient_sequence string by comma and convert it to numeric
+recipient_numbers <- as.numeric(strsplit(recipient_sequence, ",")[[1]])
+# Repeat each number twice
+doubled_recipient_numbers <- rep(recipient_numbers, each = 2)
+# Repeat the entire sequence twice to get at least 2000 elements
+recipient_pop <- rep(doubled_recipient_numbers, times = 12)
+
+# Take the first 400 elements as I need 400 entries for the translocation design of s77
+source_s77 <- source_pop[1:400]
+recipient_s77 <- recipient_pop[1:400]
+
+# Build translocation matrix
+TranslocationMatrix <- matrix(c(
+  rep(seq(20,215,by=10), each=20), #Years
+  c(source_s77), # Source pop
+  c(recipient_s77), # Target pop
+  rep(1, 400), # Number of individuals to be translocated 
+  rep(1, 400), # min. age (-9 means not defined)
+  rep(5, 400), # max. age (-9 means not defined)
+  rep(-9, 400), # stage of individuals
+  rep(c(1, 0), times = 200) # sex (-9 means not defined)
+  ),
+  ncol = 8,
+  byrow = F)
+
+Years <- seq(20,215,by=10) # Years in which translocations occur - must be the unique values set in matrix
+catching_rate <- 1 # probability of catching the individual(s); if <1, then not all the given number of individuals are translocated
+translocation <- Translocation(years = Years, TransLocMat = TranslocationMatrix, catching_rate = catching_rate)
+
+management <- Management(Translocation = translocation)
+
+#### 8 inds every 5 years ####
+# Take the first 800 elements as I need 800 entries for the translocation design of s78
+source_s78 <- source_pop[1:800]
+recipient_s78 <- recipient_pop[1:800]
+
+TranslocationMatrix2 <- matrix(c(
+  rep(seq(20,215,by=5), each=20), #Years
+  source_s78, # Source pop
+  recipient_s78, # Target pop
+  rep(4, 800), # Number of individuals to be translocated 
+  rep(1, 800), # min. age (-9 means not defined)
+  rep(5, 800), # max. age (-9 means not defined)
+  rep(-9, 800), # stage of individuals
+  rep(c(1, 0), times = 400) # sex (-9 means not defined)
+  ),
+  ncol = 8,
+  byrow = F)
+
+Years2 <- seq(from = 20, to = 215, by = 5)
+translocation2 <- Translocation(years = Years2, TransLocMat = TranslocationMatrix2, catching_rate = catching_rate)
+management2 <- Management(Translocation = translocation2)
+
+#### 8 inds. every 5 years EXCLUDING small populations as source####
+## Here I alter the second generated source sequence to match the respective matrix 
+# Split the source_sequence string by comma and convert it to numeric
+source_numbers2 <- as.numeric(strsplit(source_sequence2, ",")[[1]])
+# Repeat each number twice
+doubled_source_numbers2 <- rep(source_numbers2, each = 2)
+# Repeat the entire sequence to get at least 2000 elements
+source_pop2 <- rep(doubled_source_numbers2, times = 20)
+
+# Take the first 800 elements as I need 800 entries for the translocation design of s79
+source_s79 <- source_pop2[1:800]
+recipient_s79 <- recipient_pop[1:800]
+TranslocationMatrix3 <- matrix(c(
+  rep(seq(20,215,by=5), each=20), #Years
+  source_s79, # Source pop
+  recipient_s79, # Target pop
+  rep(4, 800), # Number of individuals to be translocated 
+  rep(1, 800), # min. age (-9 means not defined)
+  rep(5, 800), # max. age (-9 means not defined)
+  rep(-9, 800), # stage of individuals
+  rep(c(1, 0), times = 400) # sex (-9 means not defined)
+  ),
+  ncol = 8,
+  byrow = F)
+
+translocation3 <- Translocation(years = Years2, TransLocMat = TranslocationMatrix3, catching_rate = catching_rate)
+management3 <- Management(Translocation = translocation3)
+
+#### 10 inds every 2 years ####
+# Take the first 2000 elements as I need 2000 entries for the translocation design of s80
+source_s80 <- source_pop[1:2000]
+recipient_s80 <- recipient_pop[1:2000]
+
+TranslocationMatrix4 <- matrix(c(
+  rep(seq(20,218,by=2), each=20), #Years
+  source_s80, # Source pop
+  recipient_s80, # Target pop
+  rep(5, 2000), # Number of individuals to be translocated 
+  rep(1, 2000), # min. age (-9 means not defined)
+  rep(5, 2000), # max. age (-9 means not defined)
+  rep(-9, 2000), # stage of individuals
+  rep(c(1, 0), times = 1000) # sex (-9 means not defined)
+  ),
+  ncol = 8,
+  byrow = F)
+
+Years4 <- seq(from = 20, to = 218, by = 2)
+translocation4 <- Translocation(years = Years4, TransLocMat = TranslocationMatrix4, catching_rate = catching_rate)
+management4 <- Management(Translocation = translocation4)
+
+#### 10 inds every 2 years EXCLUDING small populations as source ####
+# Take the first 2000 elements as I need 2000 entries for the translocation design of s81
+source_s81 <- source_pop2[1:2000]
+recipient_s81 <- recipient_pop[1:2000]
+
+TranslocationMatrix5 <- matrix(c(
+  rep(seq(20,218,by=2), each=20), #Years
+  source_s81, # Source pop
+  recipient_s81, # Target pop
+  rep(5, 2000), # Number of individuals to be translocated 
+  rep(1, 2000), # min. age (-9 means not defined)
+  rep(5, 2000), # max. age (-9 means not defined)
+  rep(-9, 2000), # stage of individuals
+  rep(c(1, 0), times = 1000) # sex (-9 means not defined)
+  ),
+  ncol = 8,
+  byrow = F)
+
+translocation5 <- Translocation(years = Years4, TransLocMat = TranslocationMatrix5, catching_rate = catching_rate)
+management5 <- Management(Translocation = translocation5)
+```
+
+# Initialisation settings
+```{r}
+init2 <- Initialise(InitType = 2, InitIndsFile = "init_pop2.txt")
+# patchID_borecka <- 6
+# patchID_augustowska <- 4 (23 inds)
+# patchID_knyszyn <- 15
+# patchID_bialowieza <- 23
+# patchID_bieszczady <- 109
+# patchID_west_poland_mainpatch <- 22  
+# patchID_west_poland_patch2 <- 24    
+# patchID_rothaar <- 83 (30 inds)
+# patchID_romincka <- 2 (9 inds)
+# patchID_janowskie <- 73 (9inds)
+```
+
+
+# Simulation settings
+```{r}
+minR_value <- 0.259 #based on the lowest recorded coeffiecient of fecundity in Krasinska book - 25.9% (year 2000)
+maxR_value <- 0.594 #now took the highest value of coefficient of fecundity from Krasinska book that occurred since 1970 - the value was 59.4% (in 1994)
+sim_ID <- 1
+## Hartway et al. (2020) ran their VORTEX model for 200 years with 500 replicates
+sim <- Simulation(Simulation = 1,
+                  Replicates = 100,
+                  Years = 220,
+                  EnvStoch = 1, # 0=no, 1=activated
+                  EnvStochType = 0, # environmental stochasticity is applied to fecundity
+                  std = 0.155, # >0 and <=1.0 | SD of fecundity in Krasinska & Krasinski (2013)
+                  ac = 0, # 0-1 temporal autocorrelation coefficient of EnvStoch
+                  minR = minR_value,
+                  maxR = maxR_value,
+                  OutIntRange = 10,
+                  OutIntPop = 10,
+                  OutStartPop = 20,
+                  OutIntOcc = 10,
+                  OutIntPaths = 10,
+                  OutIntConn = 10,
+                  OutIntInd = 10,
+                  OutStartInd = 20,
+                  OutIntGenetic = 10, #Genetic output 
+                  OutStartGenetic = 20,
+                  OutGenType = 1, # 1 = all individuals
+                  OutGenCrossTab = T, # will generate genetics output as cross table
+                  SMSHeatMap = TRUE)
+# start output not before spinup (dynamic landscapes) 
+
+sim
+```
+
+# Parameter master
+```{r}
+#### Base-model / do-nothing scenario ####
+# Low Dispersal Extra stage disperses starting age 2 (with spinup)
+s9low <- RSsim(batchnum = 9,
+               simul = sim, land = land, demog = demo3, dispersal = disp2, gene = gen_mod, init = init2,
+               seed = 1909)
+
+#### Wildlife Corridor Scenario ####
+s_corridor <- RSsim(batchnum = 99,
+                    simul = sim, land = land2, demog = demo3, dispersal = disp2, gene = gen_mod, init = init2,
+                    seed = 1909)
+# Check the parameter master (or any single module) for potential parameter conflicts:
+validateRSparams(s_corridor)
+## Save the parameter master object of the respective model run (needed to pull results later on)
+saveRDS(s_corridor, paste0("Models/s_b", 1, "_s", 99, ".rds"))
+#### Translocation Scenarios ####
+s_translocations <- RSsim(batchnum = 77,
+                          simul = sim, land = land, demog = demo3, dispersal = disp2, gene = gen_mod, management = management, init = init2,
+                          seed = 1909)
+s_translocations2 <- RSsim(batchnum = 78,
+                          simul = sim, land = land, demog = demo3, dispersal = disp2, gene = gen_mod, management = management2, init = init2,
+                          seed = 1909)
+saveRDS(s_translocations, paste0("Models/s_b", 1, "_s", 78, ".rds"))
+s_translocations3 <- RSsim(batchnum = 79,
+                           simul = sim, land = land, demog = demo3, dispersal = disp2, gene = gen_mod, management = management3, init = init2,
+                           seed = 1909)
+saveRDS(s_translocations3, paste0("Models/s_b", 1, "_s", 79, ".rds"))
+s_translocations4 <- RSsim(batchnum = 80,
+                           simul = sim, land = land, demog = demo3, dispersal = disp2, gene = gen_mod, management = management4, init = init2,
+                           seed = 1909)
+saveRDS(s_translocations4, paste0("Models/s_b", 1, "_s", 80, ".rds"))
+s_translocations5 <- RSsim(batchnum = 81,
+                           simul = sim, land = land, demog = demo3, dispersal = disp2, gene = gen_mod, management = management5, init = init2,
+                           seed = 1909)
+saveRDS(s_translocations5, paste0("Models/s_b", 1, "_s", 81, ".rds"))
+#### Ecoduct Scenario ####
+s_ecoducts <- RSsim(batchnum = 66,
+                    simul = sim, land = land3, demog = demo3, dispersal = disp2, gene = gen_mod, init = init2,
+                    seed = 1909)
+## Save the parameter master object of the respective model run (needed to pull results later on)
+saveRDS(s_ecoducts, paste0("Models/s_b", 1, "_s", 66, ".rds"))
+```
+
+# Run simulations
+```{r}
+#### Base-model / do-nothing Scenario ####
+# Low dispersal
+#RunRS(s9low,dirpath)
+#### Wildlife Corridor Scenario ####
+#RunRS(s_corridor, dirpath)
+#### Translocation Scenario ####
+RunRS(s_translocations, dirpath)
+RunRS(s_translocations2, dirpath)
+RunRS(s_translocations3, dirpath)
+RunRS(s_translocations4, dirpath)
+RunRS(s_translocations5, dirpath)
+#### Ecoduct Scenario ####
+#RunRS(s_ecoducts, dirpath)
+```
+
+# Allelic Diversity
+Calculations on allelic diversity were run on the cluster in a seperate script (Allelic_div_heterozygosity.R)
+## Plotting allelic diversity
+```{r}
+load("data/Allelic_div_list.RData")
+# Names for the data frames
+file_names <- c("Base model","Ecoducts", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5", "Wildlife Corridors")
+# Define a named vector mapping PatchIDs to their names
+patch_names <- c(
+  "6" = "Borecka",
+  "4" = "Augustowska",
+  "15" = "Knyszyn",
+  "23" = "Bialowieza",
+  "109" = "Bieszczady",
+  "22" = "West Poland 1",
+  "24" = "West Poland 2",
+  "83" = "Rothaar",
+  "2" = "Romincka",
+  "73" = "Janowskie"
+)
+# Update Patch_Name in each data frame in the list
+Allelic_div_list <- lapply(Allelic_div_list, function(df) {
+  df %>%
+    mutate(Patch_Name = patch_names[as.character(PatchID)])
+})
+
+# Rename the data frames in the list
+names(Allelic_div_list) <- file_names
+
+# Define the PatchID values to keep
+patch_ids_to_keep <- c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73)
+# Filter the rows for each data frame in the list
+for (i in seq_along(Allelic_div_list)) {
+  Allelic_div_list[[i]] <- Allelic_div_list[[i]][Allelic_div_list[[i]]$PatchID %in% patch_ids_to_keep, ]
+}
+
+# Combine the data frames into one
+Allelic_div_combined <- bind_rows(Allelic_div_list, .id = "Scenario")
+# Reorder "Scenario"
+desired_order <- c("Base model", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5", "Wildlife Corridors", "Ecoducts")
+Allelic_div_combined$Scenario <- factor(Allelic_div_combined$Scenario, levels = desired_order)
+# Overall (not per population)
+ggplot(Allelic_div_combined, aes(x = Year, y = A)) +
+  geom_smooth(method = "loess") +
+  labs(y = "Allelic Diversity") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22), # For facet_wrap text
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Allelic diversity across all populations over time")
+#ggsave(filename = "Plots/Allelic_div_over_time_overall.png")
+# Plot allelic diversity over time per population
+ggplot(Allelic_div_combined, aes(x = Year, y = A, colour = Patch_Name)) +
+  geom_smooth(method = "loess") +
+  labs(y = "Allelic Diversity", colour = "Population") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22),
+        legend.title = element_text(size = 22),
+        legend.text = element_text(size = 20),
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Allelic diversity in individual populations over time")
+#ggsave(filename = "Plots/Allelic_div_over_time_ind_populations.png")
+# Maybe exclude Rothaar?
+# Overall (not per population) WITHOUT Rothaar
+#ggplot(Allelic_div_combined[Allelic_div_combined$Patch_Name != "Rothaar",], aes(x = Year, y = A)) +
+ # geom_smooth(method = "lm") +
+  #labs(title = "Allelic Diversity Over Time") +
+  #theme_minimal() +
+  #facet_wrap(~Source) +
+  #ggtitle("Allelic diversity across all populations over time (excluding Rothaar)")
+
+#ggplot(Allelic_div_combined[Allelic_div_combined$Patch_Name != "Rothaar",], aes(x = Year, y = A, colour = Patch_Name)) +
+ # geom_smooth(method = "lm") +
+  #labs(title = "Allelic Diversity Over Time") +
+  #theme_minimal() +
+  #facet_wrap(~Source) +
+  #ggtitle("Allelic diversity in individual populations over time (excluding Rothaar)")
+
+#### Relative change in A ####
+#### Calculate relative A ####
+Allelic_div_combined_relative <- Allelic_div_combined %>%
+  group_by(Scenario, PatchID) %>%
+  mutate(A_Year_20 = A[Year == 20],
+         Relative_A = A / A_Year_20) %>%
+  ungroup() #%>%
+  #select(-A_Year_20)  # Remove the temporary column
+# Plot relative A
+# Overall (not per population)
+ggplot(Allelic_div_combined_relative, aes(x = Year, y = Relative_A)) +
+  geom_smooth(method = "lm") +
+  labs(y = "Allelic Diversity") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22), # For facet_wrap text
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Allelic diversity across all populations over time")
+#ggsave(filename = "Plots/Allelic_div_over_time_overall.png")
+# Plot allelic diversity over time per population
+ggplot(Allelic_div_combined_relative, aes(x = Year, y = Relative_A)) +
+  geom_smooth(aes(colour = Patch_Name, group = Patch_Name)) +
+  geom_smooth(aes(group = 1), colour = "grey30", size = 1.5, linetype = "dashed", method = "lm") +
+  labs(y = "Relative allelic Diversity", colour = "Population") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 35),
+        axis.text = element_text(size = 35),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        strip.text = element_text(size = 35),
+        legend.title = element_text(size = 35),
+        legend.text = element_text(size = 35),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 35, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Relative allelic diversity in individual populations over time")
+# Plot change in A
+#ggplot(Allelic_div_combined_wide, aes(x = Scenario, y = Change_A)) +
+ # geom_boxplot() +
+  #labs(x = "Population", y = "Relative change in A") +
+  #scale_fill_discrete(name = "Scenario") +
+  #theme_minimal() +
+  #theme(axis.title = element_text(size = 25),
+   #     axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+    #    plot.title = element_text(size = 30, face = "bold")) +
+  #ggtitle("Relative change in allelic diversity in each scenario")
+#ggsave(filename = "Plots/Change_All_div.png")
+
+#### Relative A in sim. year 200 ####
+Allelic_div_combined_wide <- Allelic_div_combined %>%
+  pivot_wider(
+    names_from = Year,
+    values_from = A
+  )
+# Calculate relative A in Year 210
+Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
+  mutate(Relative_A = (`210` / `20`))
+
+# Plot relative A after 200 simulation years
+ggplot(Allelic_div_combined_wide, aes(x = Scenario, y = Relative_A)) +
+  geom_boxplot() +
+  labs(x = "Population", y = "Relative A") +
+  #scale_fill_discrete(name = "Scenario") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        plot.title = element_text(size = 30, face = "bold")) +
+  ggtitle("Relative allelic diversity after 200 simulation years")
+
+#### Deviation from Base-model ####
+values_A_bm <- Allelic_div_combined_wide %>%
+  filter(Scenario == "Base model") %>%
+  pull("Relative_A")
+Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
+  mutate(A_bm = rep(values_A_bm, length.out = n()))
+# Calculate the deviation percentage (again relative)
+Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
+  mutate(Deviation = ((Relative_A  / A_bm)))
+
+# Plotting
+ggplot(
+  data = subset(Allelic_div_combined_wide, Scenario != "Base model"),
+  aes(x = Scenario, y = Deviation)) +
+  geom_boxplot(fill = "purple") +
+    scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+  labs(x = "Scenario", y = "Relative Deviation in A") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 35),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        axis.text = element_text(size = 35),
+        #strip.text = element_text(size = 22),
+        plot.title = element_text(size = 35, face = "bold")) +
+  ggtitle("Relative deviation in allelic diversity from the base model")
+#ggsave(filename = "Plots/Dev_All_div.png")
+```
+
+## Statistical Analysis Allelic diversity
+```{r}
+#### Relative A after 200 sim. years ####
+# Check distribution 
+hist(Allelic_div_combined_relative$Relative_A)
+ggplot(Allelic_div_combined_relative, aes(x = Relative_A, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", linewidth = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Relative A Year 200", y = "Density") +
+  theme_minimal()
+shapiro.test(Allelic_div_combined_relative$Relative_A) # <0.001
+mean(Allelic_div_combined_relative$Relative_A) # 0.9911471
+var(Allelic_div_combined_relative$Relative_A) # 0.002719665
+
+# I have underdispersion, mean > var ...
+lm_log_rel_A <- lm(I(log(Relative_A)) ~ Scenario*Year, data = Allelic_div_combined_relative)
+summary(lm_log_rel_A)
+#Call:
+#lm(formula = I(log(Relative_A)) ~ Scenario * Year, data = Allelic_div_combined_relative)
+#
+#Residuals:
+#      Min        1Q    Median        3Q       Max 
+#-0.097702 -0.034452 -0.009051  0.019417  0.169964 
+#
+#Coefficients:
+#                                  Estimate Std. Error t value Pr(>|t|)   
+#(Intercept)                     -2.788e-04  7.875e-03  -0.035  0.97176   
+#ScenarioTranslocation 1         -4.093e-03  1.114e-02  -0.367  0.71333   
+#ScenarioTranslocation 2          9.686e-03  1.114e-02   0.870  0.38463   
+#ScenarioTranslocation 3          5.979e-03  1.114e-02   0.537  0.59147   
+#ScenarioTranslocation 4          7.973e-03  1.114e-02   0.716  0.47415   
+#ScenarioTranslocation 5          1.422e-02  1.114e-02   1.277  0.20182   
+#ScenarioWildlife Corridors      -8.493e-03  1.114e-02  -0.763  0.44586   
+#ScenarioEcoducts                 2.657e-03  1.114e-02   0.239  0.81147   
+#Year                            -1.745e-04  6.122e-05  -2.851  0.00442 **
+#ScenarioTranslocation 1:Year     8.629e-05  8.657e-05   0.997  0.31905   
+#ScenarioTranslocation 2:Year    -6.778e-07  8.657e-05  -0.008  0.99375   
+#ScenarioTranslocation 3:Year     9.675e-05  8.657e-05   1.118  0.26391   
+#ScenarioTranslocation 4:Year     1.116e-04  8.657e-05   1.289  0.19758   
+#ScenarioTranslocation 5:Year     1.531e-04  8.657e-05   1.769  0.07710 . 
+#ScenarioWildlife Corridors:Year -3.584e-06  8.657e-05  -0.041  0.96698   
+#ScenarioEcoducts:Year            1.664e-05  8.657e-05   0.192  0.84762   
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.04992 on 1584 degrees of freedom
+#Multiple R-squared:  0.07501,	Adjusted R-squared:  0.06625 
+#F-statistic: 8.564 on 15 and 1584 DF,  p-value: < 2.2e-16
+
+
+
+#### Relative deviation from do-nothing scenario ####
+# Check distribution
+Dev_A <- subset(Allelic_div_combined_wide, Scenario != "Do-nothing")
+hist(Dev_A$Deviation) # looks normally distributed
+ggplot(Dev_A, aes(x = Deviation, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", linewidth = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Deviation in A from bm", y = "Density") +
+  theme_minimal()
+shapiro.test(Dev_A$Deviation) # 0.2757 --> NORMAL distribution confirmed
+mean(Dev_A$Deviation) # 1.015182
+var(Dev_A$Deviation) # 0.0009371794
+
+lm_dev_A <- lm(Deviation ~ Scenario, data = subset(Allelic_div_combined_wide, Scenario != "Do-nothing"))
+summary(lm_dev_A)
+# Call:
+#lm(formula = Deviation ~ Scenario, data = subset(Allelic_div_combined_wide, Scenario != "Do-nothing"))
+#
+#Residuals:
+#      Min        1Q    Median        3Q       Max 
+#-0.065761 -0.022615  0.002213  0.015132  0.064026
+#
+#Coefficients:
+#                            Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)                 1.012079   0.008965 112.891   <2e-16 ***
+#ScenarioTranslocation 2    -0.006540   0.012679  -0.516   0.6078    
+#ScenarioTranslocation 3     0.013419   0.012679   1.058   0.2939    
+#ScenarioTranslocation 4     0.013335   0.012679   1.052   0.2969    
+#ScenarioTranslocation 5     0.026720   0.012679   2.108   0.0391 *  
+#ScenarioWildlife Corridors -0.016958   0.012679  -1.338   0.1858    
+#ScenarioEcoducts           -0.008257   0.012679  -0.651   0.5173    
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.02835 on 63 degrees of freedom
+#Multiple R-squared:  0.217,	Adjusted R-squared:  0.1424 
+#F-statistic: 2.909 on 6 and 63 DF,  p-value: 0.0144
+```
+
+
+# Genetic connectivity/similarity
+## Preparations
+```{r}
+##### Base-model (s9) #####
+# Load genetic similarity data
+load("data/s9_gen_sim_df20.Rdata")
+load("data/s9_gen_sim_df210.Rdata")
+
+# Transform patches to df
+patches_df <- as.data.frame(patches, xy=T)
+
+# Filter out only original populations
+gen_sim_df20_s9 <- gen_sim_df20_s9 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s9 <- gen_sim_df210_s9 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s9$Population1 <- factor(gen_sim_df20_s9$Population1)
+gen_sim_df20_s9$Population2 <- factor(gen_sim_df20_s9$Population2)
+gen_sim_df210_s9$Population1 <- factor(gen_sim_df210_s9$Population1)
+gen_sim_df210_s9$Population2 <- factor(gen_sim_df210_s9$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s9 <- gen_sim_df20_s9 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s9) == nrow(gen_sim_df20_s9)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s9 <- gen_sim_df210_s9 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s9) == nrow(gen_sim_df210_s9)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s9)[names(sim_for_plot20_s9) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s9)[names(sim_for_plot210_s9) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s9$Year <- 20
+sim_for_plot210_s9$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s9 <- merge(sim_for_plot20_s9, sim_for_plot210_s9, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s9$Model <- "Base model"
+attach(merged_sim_s9)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s9 <- transform(merged_sim_s9, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s9 <- transform(merged_sim_s9, Percentage_Change = change*100)
+save(merged_sim_s9, file = "data/merged_sim_s9.RData")
+
+##### Translocation1 (s77) ####
+# Load genetic similarity data
+load("data/s77_gen_sim_df20.Rdata")
+load("data/s77_gen_sim_df210.Rdata")
+
+# Filter out only original populations
+gen_sim_df20_s77 <- gen_sim_df20_s77 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s77 <- gen_sim_df210_s77 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s77$Population1 <- factor(gen_sim_df20_s77$Population1)
+gen_sim_df20_s77$Population2 <- factor(gen_sim_df20_s77$Population2)
+gen_sim_df210_s77$Population1 <- factor(gen_sim_df210_s77$Population1)
+gen_sim_df210_s77$Population2 <- factor(gen_sim_df210_s77$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s77 <- gen_sim_df20_s77 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s77) == nrow(gen_sim_df20_s77)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s77 <- gen_sim_df210_s77 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s77) == nrow(gen_sim_df210_s77)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s77)[names(sim_for_plot20_s77) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s77)[names(sim_for_plot210_s77) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s77$Year <- 20
+sim_for_plot210_s77$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s77 <- merge(sim_for_plot20_s77, sim_for_plot210_s77, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s77$Model <- "Translocation 1"
+attach(merged_sim_s77)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s77 <- transform(merged_sim_s77, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s77 <- transform(merged_sim_s77, Percentage_Change = change*100)
+save(merged_sim_s77, file = "data/merged_sim_s77.RData")
+
+##### Translocation2 (s78) ####
+# Load genetic similarity data
+load("data/s78_gen_sim_df20.Rdata")
+load("data/s78_gen_sim_df210.Rdata")
+
+# Transform patches to df
+patches_df <- as.data.frame(patches, xy=T)
+
+# Filter out only original populations
+gen_sim_df20_s78 <- gen_sim_df20_s78 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s78 <- gen_sim_df210_s78 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s78$Population1 <- factor(gen_sim_df20_s78$Population1)
+gen_sim_df20_s78$Population2 <- factor(gen_sim_df20_s78$Population2)
+gen_sim_df210_s78$Population1 <- factor(gen_sim_df210_s78$Population1)
+gen_sim_df210_s78$Population2 <- factor(gen_sim_df210_s78$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s78 <- gen_sim_df20_s78 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s78) == nrow(gen_sim_df20_s78)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s78 <- gen_sim_df210_s78 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s78) == nrow(gen_sim_df210_s78)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s78)[names(sim_for_plot20_s78) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s78)[names(sim_for_plot210_s78) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s78$Year <- 20
+sim_for_plot210_s78$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s78 <- merge(sim_for_plot20_s78, sim_for_plot210_s78, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s78$Model <- "Translocation 2"
+attach(merged_sim_s78)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s78 <- transform(merged_sim_s78, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s78 <- transform(merged_sim_s78, Percentage_Change = change*100)
+save(merged_sim_s78, file = "data/merged_sim_s78.RData")
+
+##### Translocation3 (s79) ####
+# Load genetic similarity data
+load("data/s79_gen_sim_df20.Rdata")
+load("data/s79_gen_sim_df210.Rdata")
+
+# Filter out only original populations
+gen_sim_df20_s79 <- gen_sim_df20_s79 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s79 <- gen_sim_df210_s79 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s79$Population1 <- factor(gen_sim_df20_s79$Population1)
+gen_sim_df20_s79$Population2 <- factor(gen_sim_df20_s79$Population2)
+gen_sim_df210_s79$Population1 <- factor(gen_sim_df210_s79$Population1)
+gen_sim_df210_s79$Population2 <- factor(gen_sim_df210_s79$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s79 <- gen_sim_df20_s79 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s79) == nrow(gen_sim_df20_s79)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s79 <- gen_sim_df210_s79 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s79) == nrow(gen_sim_df210_s79)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s79)[names(sim_for_plot20_s79) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s79)[names(sim_for_plot210_s79) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s79$Year <- 20
+sim_for_plot210_s79$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s79 <- merge(sim_for_plot20_s79, sim_for_plot210_s79, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s79$Model <- "Translocation 3"
+attach(merged_sim_s79)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s79 <- transform(merged_sim_s79, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s79 <- transform(merged_sim_s79, Percentage_Change = change*100)
+save(merged_sim_s79, file = "data/merged_sim_s79.RData")
+
+#### Translocation 4 (s80) ####
+# Load genetic similarity data
+load("data/s80_gen_sim_df20.Rdata")
+load("data/s80_gen_sim_df210.Rdata")
+
+# Filter out only original populations
+gen_sim_df20_s80 <- gen_sim_df20_s80 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s80 <- gen_sim_df210_s80 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s80$Population1 <- factor(gen_sim_df20_s80$Population1)
+gen_sim_df20_s80$Population2 <- factor(gen_sim_df20_s80$Population2)
+gen_sim_df210_s80$Population1 <- factor(gen_sim_df210_s80$Population1)
+gen_sim_df210_s80$Population2 <- factor(gen_sim_df210_s80$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s80 <- gen_sim_df20_s80 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s80) == nrow(gen_sim_df20_s80)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s80 <- gen_sim_df210_s80 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s80) == nrow(gen_sim_df210_s80)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s80)[names(sim_for_plot20_s80) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s80)[names(sim_for_plot210_s80) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s80$Year <- 20
+sim_for_plot210_s80$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s80 <- merge(sim_for_plot20_s80, sim_for_plot210_s80, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s80$Model <- "Translocation 4"
+attach(merged_sim_s80)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s80 <- transform(merged_sim_s80, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s80 <- transform(merged_sim_s80, Percentage_Change = change*100)
+save(merged_sim_s80, file = "data/merged_sim_s80.RData")
+
+##### Translocation5 (s81) ####
+# Load genetic similarity data
+load("data/s81_gen_sim_df20.Rdata")
+load("data/s81_gen_sim_df210.Rdata")
+
+# Filter out only original populations
+gen_sim_df20_s81 <- gen_sim_df20_s81 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s81 <- gen_sim_df210_s81 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s81$Population1 <- factor(gen_sim_df20_s81$Population1)
+gen_sim_df20_s81$Population2 <- factor(gen_sim_df20_s81$Population2)
+gen_sim_df210_s81$Population1 <- factor(gen_sim_df210_s81$Population1)
+gen_sim_df210_s81$Population2 <- factor(gen_sim_df210_s81$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s81 <- gen_sim_df20_s81 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s81) == nrow(gen_sim_df20_s81)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s81 <- gen_sim_df210_s81 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s81) == nrow(gen_sim_df210_s81)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s81)[names(sim_for_plot20_s81) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s81)[names(sim_for_plot210_s81) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s81$Year <- 20
+sim_for_plot210_s81$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s81 <- merge(sim_for_plot20_s81, sim_for_plot210_s81, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s81$Model <- "Translocation 5"
+attach(merged_sim_s81)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s81 <- transform(merged_sim_s81, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s81 <- transform(merged_sim_s81, Percentage_Change = change*100)
+save(merged_sim_s81, file = "data/merged_sim_s81.RData")
+##### Corridors (s99) ####
+# Load genetic similarity data
+load("data/s99_gen_sim_df20.Rdata")
+load("data/s99_gen_sim_df210.Rdata")
+
+# Transform patches to df
+patches_df <- as.data.frame(patches, xy=T)
+
+# Filter out only original populations
+gen_sim_df20_s99 <- gen_sim_df20_s99 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s99 <- gen_sim_df210_s99 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s99$Population1 <- factor(gen_sim_df20_s99$Population1)
+gen_sim_df20_s99$Population2 <- factor(gen_sim_df20_s99$Population2)
+gen_sim_df210_s99$Population1 <- factor(gen_sim_df210_s99$Population1)
+gen_sim_df210_s99$Population2 <- factor(gen_sim_df210_s99$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s99 <- gen_sim_df20_s99 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s99) == nrow(gen_sim_df20_s99)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s99 <- gen_sim_df210_s99 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s99) == nrow(gen_sim_df210_s99)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s99)[names(sim_for_plot20_s99) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s99)[names(sim_for_plot210_s99) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s99$Year <- 20
+sim_for_plot210_s99$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s99 <- merge(sim_for_plot20_s99, sim_for_plot210_s99, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s99$Model <- "Wildlife Corridors"
+attach(merged_sim_s99)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s99 <- transform(merged_sim_s99, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s99 <- transform(merged_sim_s99, Percentage_Change = change*100)
+save(merged_sim_s99, file = "data/merged_sim_s99.RData")
+
+##### Ecoducts ####
+# Load genetic similarity data
+load("data/s66_gen_sim_df20.Rdata")
+load("data/s66_gen_sim_df210.Rdata")
+
+# Transform patches to df
+patches_df <- as.data.frame(patches, xy=T)
+
+# Filter out only original populations
+gen_sim_df20_s66 <- gen_sim_df20_s66 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+gen_sim_df210_s66 <- gen_sim_df210_s66 %>%
+  filter(Population1 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) &
+           Population2 %in% c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73))
+
+## Turn population id into a factor for both years
+gen_sim_df20_s66$Population1 <- factor(gen_sim_df20_s66$Population1)
+gen_sim_df20_s66$Population2 <- factor(gen_sim_df20_s66$Population2)
+gen_sim_df210_s66$Population1 <- factor(gen_sim_df210_s66$Population1)
+gen_sim_df210_s66$Population2 <- factor(gen_sim_df210_s66$Population2)
+
+# Subset patches_df to have only one lon & lat value per population
+names(patches_df)[names(patches_df) == "b_patches_75km2_med"] <- "id"
+names(patches_df)[names(patches_df) == "x"] <- "long"
+names(patches_df)[names(patches_df) == "y"] <- "lat"
+colnames(patches_df)[3]<-"id"
+patches_df_sub <- patches_df[!duplicated(patches_df[, "id"]),]
+patches_df_sub$id <- as.factor(patches_df_sub$id)
+## Further processing for plotting
+# First year
+sim_for_plot20_s66 <- gen_sim_df20_s66 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot20_s66) == nrow(gen_sim_df20_s66)) # row numbers are equal
+
+# Last year
+sim_for_plot210_s66 <- gen_sim_df210_s66 %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population1" = "id")) %>%
+  rename(x = long, y = lat) %>%
+  inner_join(patches_df_sub %>% dplyr::select(id, long, lat), by = c("Population2" = "id")) %>%
+  rename(xend = long, yend = lat)
+
+assert_that(nrow(sim_for_plot210_s66) == nrow(gen_sim_df210_s66)) # row numbers are equal
+
+# Change name of genetic distance column
+names(sim_for_plot20_s66)[names(sim_for_plot20_s66) == "Avg_Gen_sim"] <- "Genetic Similarity"
+names(sim_for_plot210_s66)[names(sim_for_plot210_s66) == "Avg_Gen_sim"] <- "Genetic Similarity"
+##################### FUCK YES THIS IS THE WAY 
+# I first need to add a year column to the "original" dfs
+sim_for_plot20_s66$Year <- 20
+sim_for_plot210_s66$Year <- 210
+
+# Now merge them to one df for further use
+merged_sim_s66 <- merge(sim_for_plot20_s66, sim_for_plot210_s66, by = c("Population1", "Population2", "x", "y", "xend", "yend"), all = T)
+merged_sim_s66$Model <- "Ecoducts"
+attach(merged_sim_s66)
+# Calculate change in genetic distance (for those populations existing in both years)
+merged_sim_s66 <- transform(merged_sim_s66, change = `Genetic Similarity.y` / `Genetic Similarity.x`)
+# Percentage of change
+merged_sim_s66 <- transform(merged_sim_s66, Percentage_Change = change*100)
+save(merged_sim_s66, file = "data/merged_sim_s66.RData")
+```
+
+## Effect plot for genetic similarity
+```{r}
+# First merge single dfs per scenario to one big df containing all data across scenarios
+Gen_sim_all <- bind_rows(merged_sim_s9, merged_sim_s66, merged_sim_s77, merged_sim_s78, merged_sim_s79, merged_sim_s80, merged_sim_s81, merged_sim_s99)
+#### Calculate Relative gen. sim year 200 ####
+Gen_sim_all <- Gen_sim_all %>%
+  mutate(Rel_gen_sim_200 = `Genetic.Similarity.y`/`Genetic.Similarity.x`,
+         Rel_gen_sim_20 = `Genetic.Similarity.x`/`Genetic.Similarity.x`)
+#### Calculate Deviation from bm ####
+Gen_sim_all$Gen_sim_bm <- Gen_sim_all$Rel_gen_sim_200[Gen_sim_all$Model=="Base model"]
+# Calculate the deviation 
+Gen_sim_all <- Gen_sim_all %>%
+  mutate(Deviation = Rel_gen_sim_200/Gen_sim_bm)
+# Add "deviation type". Is the change positive or negative?
+Gen_sim_all$Deviation_Type <- ifelse(Gen_sim_all$Deviation > 1, "Positive", "Negative")
+## Now to the plotting
+# First reorder "Model" variable
+desired_order <- c("Base model", "Wildlife Corridors", "Ecoducts", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5")
+Gen_sim_all$Model <- factor(Gen_sim_all$Model, levels = desired_order)
+
+attach(Gen_sim_all)
+ggplot(data = subset(Gen_sim_all, Model != "Base model"),
+       aes(x = Model, y = Deviation)) +
+    geom_boxplot(fill = "coral") + 
+    scale_x_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+    theme_minimal() +
+    theme(axis.title = element_text(size = 35),
+          axis.text = element_text(size = 35),
+          axis.title.x = element_text(margin = margin(t = 20)),
+          axis.title.y = element_text(margin = margin(r = 20)),
+          #strip.text = element_text(size = 22),
+          #legend.title = element_text(size = 22),
+          #legend.text = element_text(size = 20),
+          plot.title = element_text(size = 35, face = "bold")) +
+      labs(x = "Scenario", y = "Relative deviation of genetic similarity") +
+      ggtitle("Relative deviation of genetic similarity after 200 years from the base model between scenarios")
+#ggsave("Plots/Deviation_gen_sim.png")
+
+#----------------------
+df_names <- c("gen_sim_df20_s9", "gen_sim_df210_s9","gen_sim_df20_s66", "gen_sim_df210_s66", "gen_sim_df20_s77", "gen_sim_df210_s77", "gen_sim_df20_s78", "gen_sim_df210_s78", "gen_sim_df20_s79", "gen_sim_df210_s79","gen_sim_df20_s80", "gen_sim_df210_s80","gen_sim_df20_s81", "gen_sim_df210_s81", "gen_sim_df20_s99", "gen_sim_df210_s99")
+
+Avg_gen_sim_list <- list()
+for (df_name in df_names) {
+  #Extract the year from df
+  year <- as.numeric(gsub("gen_sim_df|_s\\d+", "", df_name))
+  
+   # Determine the scenario based on the dataframe name
+  Model <- case_when(
+    grepl("_s9$", df_name) ~ "Base model",
+    grepl("_s66$", df_name) ~ "Ecoducts",
+    grepl("_s77$", df_name) ~ "Translocation 1",
+    grepl("_s78$", df_name) ~ "Translocation 2",
+    grepl("_s79$", df_name) ~ "Translocation 3",
+    grepl("_s80$", df_name) ~ "Translocation 4",
+    grepl("_s81$", df_name) ~ "Translocation 5",
+    grepl("_s99$", df_name) ~ "Wildlife Corridors"
+  )
+  
+  # Extract df object
+  df <- get(df_name) 
+  # Add the Year and Scenario columns
+  df <- df %>%
+    mutate(Year = year,
+           Model = Model)
+  # Store df in list
+  Avg_gen_sim_list[[df_name]] <- df
+  }
+# Merge dfs from list
+Avg_gen_sim <- bind_rows(Avg_gen_sim_list, .id = "ID")
+# Create a new column for population pairs
+Avg_gen_sim$PopulationPair <- apply(Avg_gen_sim[, c("Population1", "Population2")], 1, function(x) paste(sort(x), collapse = "-"))
+Avg_gen_sim <- Avg_gen_sim %>%
+  group_by(Year, Model) %>%
+  distinct(PopulationPair, .keep_all = TRUE)
+
+Avg_gen_sim210 <- subset(Avg_gen_sim, Year == "210")
+
+desired_order <- c("Base model", "Wildlife Corridors", "Ecoducts", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5")
+Avg_gen_sim$Model <- factor(Avg_gen_sim$Model, levels = desired_order)
+# Plotting avg. gen. connectivity in different scenarios between the years
+ggplot(data = Avg_gen_sim, 
+       aes(x = as.character(Year), y = Avg_Gen_sim, fill = Model)) +
+  geom_boxplot() +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 22),
+        legend.text = element_text(size = 20),
+        plot.title = element_text(size = 30, face = "bold")) +
+  labs(x = "Year", y = "Nei's genetic similarity index") +
+  ggtitle("Average genetic connectivity between European bison populations in the first and last output year")
+#ggsave("Plots/Avg_gen_sim_years.png")
+
+## Calculate Change in genetic similarity
+# Spread the data to have separate columns for Year 20 and Year 210
+
+
+Avg_gen_sim_wide <- Avg_gen_sim %>%
+  select(PopulationPair, Year, Avg_Gen_sim) %>%
+  spread(key = Year, value = Avg_Gen_sim)
+# Rename columns for clarity
+Avg_gen_sim_wide <- Avg_gen_sim_wide %>%
+  rename(Avg_Gen_sim_20 = `20`,
+         Avg_Gen_sim_210 = `210`)
+# Calculate the change in Avg_Gen_sim between Year 20 and Year 210
+Avg_gen_sim_wide <- Avg_gen_sim_wide %>%
+  mutate(Change_relative = ((Avg_Gen_sim_210 - Avg_Gen_sim_20) / Avg_Gen_sim_20),
+         Percentage_Change_relative = (Change_relative * 100)) # This is the relative change in %
+
+#desired_order <- c("Do-nothing", "T(2inds. 10yrs)", "T(8inds. 5yrs)", "TExclSmall(8inds. 5yrs)", "T(10inds. 2yrs)", "TExclSmall(10inds. 2yrs)", "Corridors", "Ecoducts")
+#Avg_gen_sim_wide$Scenario <- factor(Avg_gen_sim_wide$Scenario, levels = desired_order)
+# Plotting avg. gen. connectivity in different scenarios between the years
+ggplot(data = Avg_gen_sim_wide, 
+       aes(x = Model, y = Change_relative)) +
+  geom_boxplot(fill = "lightpink4") +
+  scale_x_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 30),
+        axis.text = element_text(size = 30),
+        axis.title.x = element_text(margin = margin(t = 20)),
+          axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        #legend.title = element_text(size = 22),
+        #legend.text = element_text(size = 20),
+        plot.title = element_text(size = 30, face = "bold")) +
+  labs(x = "Model/Scenario", y = "Relative change in Nei's genetic similarity index") +
+  ggtitle("Relative change in average genetic connectivity between European bison populations over 200 simulation years")
+#ggsave("Plots/Change%_gen_sim.png")
+
+# Plotting avg. gen. connectivity in different scenarios per population pair between the years
+#ggplot(data = Avg_gen_sim, 
+ #      aes(x = as.character(Year), y = Avg_Gen_sim, fill = Scenario)) +
+  #geom_bar(stat = "identity", position = "dodge") +
+  #facet_wrap(~PopulationPair) +
+  #labs(x = "Year", y = "Nei's genetic similarity index") +
+  #ggtitle("Average genetic connectivity between European bison populations 
+   #       between the years")
+#ggsave("Plots/Avg_gen_sim_poppairs_years.png")
+```
+## Statistical comparison
+```{r}
+#### Relative genetic connectivity/similarity ####
+par(mfrow=c(1,1))
+hist(Gen_sim_all$Rel_gen_sim_200) 
+ggplot(Gen_sim_all, aes(x = Rel_gen_sim_200, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", size = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Relative genetic similarity in year 200", y = "Density") +
+  theme_minimal()
+
+qqnorm(Gen_sim_all$Rel_gen_sim_200, col = "steelblue")
+qqline(Gen_sim_all$Rel_gen_sim_200, col = "red")
+# let's compare means between scenarios and year
+# First test for normal distribution of data
+shapiro.test(Gen_sim_all$Rel_gen_sim_200) # <0.001 --> non-normal
+# Compare mean and variance
+mean(Gen_sim_all$Rel_gen_sim_200) #1.123563
+var(Gen_sim_all$Rel_gen_sim_200) #0.3001368
+
+lm_log_gen_sim <- lm(I(log(Rel_gen_sim_200)) ~ Model, data = Gen_sim_all)
+summary(lm_log_gen_sim)
+# Call:
+#lm(formula = I(log(Rel_gen_sim_200)) ~ Model, data = Gen_sim_all)
+#
+#Residuals:
+#     Min       1Q   Median       3Q      Max 
+#-0.94802 -0.33389  0.00626  0.32807  1.05695 
+#
+#Coefficients:
+#                         Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)             -0.181985   0.047302  -3.847  0.00013 ***
+#ModelWildlife Corridors  0.004116   0.066896   0.062  0.95095    
+#ModelEcoducts            0.012927   0.066896   0.193  0.84683    
+#ModelTranslocation 1     0.067044   0.066896   1.002  0.31658    
+#ModelTranslocation 2     0.204881   0.066896   3.063  0.00228 ** 
+#ModelTranslocation 3     0.308672   0.066896   4.614 4.68e-06 ***
+#ModelTranslocation 4     0.398794   0.066896   5.961 3.93e-09 ***
+#ModelTranslocation 5     0.479739   0.066896   7.171 1.86e-12 ***
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.4488 on 712 degrees of freedom
+#Multiple R-squared:  0.1397,	Adjusted R-squared:  0.1313 
+#F-statistic: 16.52 on 7 and 712 DF,  p-value: < 2.2e-16
+
+#### Deviation from base-model ####
+Gen_sim_dev <- subset(Gen_sim_all, Model != "Do-nothing")
+hist(Gen_sim_dev$Deviation) 
+ggplot(Gen_sim_dev, aes(x = Deviation, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", size = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Deviation Gen Sim from base-model", y = "Density") +
+  theme_minimal()
+
+qqnorm(Gen_sim_dev$Deviation, col = "steelblue")
+qqline(Gen_sim_dev$Deviation, col = "red")
+# let's compare means between scenarios and year
+# First test for normal distribution of data
+shapiro.test(Gen_sim_dev$Deviation) # <0.001 --> non-normal
+# Compare mean and variance
+mean(Gen_sim_dev$Deviation) #1.329616
+var(Gen_sim_all$Deviation) #0.3627409
+
+lm_log_gen_dev <- lm(I(log(Deviation)) ~ Model, data = subset(Gen_sim_all, Model != "Do-nothing"))
+summary(lm_log_gen_dev)
+#Call:
+#lm(formula = I(log(Deviation)) ~ Model, data = subset(Gen_sim_all, Model != "Do-nothing"))
+#
+#Residuals:
+#     Min       1Q   Median       3Q      Max 
+#-0.74003 -0.13688 -0.02048  0.05705  1.17950 
+#
+#Coefficients:
+#                     Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)          0.004116   0.031937   0.129    0.897    
+#ModelEcoducts        0.008811   0.045166   0.195    0.845    
+#ModelTranslocation 1 0.062927   0.045166   1.393    0.164    
+#ModelTranslocation 2 0.200765   0.045166   4.445 1.04e-05 ***
+#ModelTranslocation 3 0.304555   0.045166   6.743 3.55e-11 ***
+#ModelTranslocation 4 0.394678   0.045166   8.738  < 2e-16 ***
+#ModelTranslocation 5 0.475623   0.045166  10.530  < 2e-16 ***
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.303 on 623 degrees of freedom
+#Multiple R-squared:  0.257,	Adjusted R-squared:  0.2499 
+#F-statistic: 35.92 on 6 and 623 DF,  p-value: < 2.2e-16
+```
+
+# Mapping change in genetic similarity
+```{r}
+#### Base model ####
+# As there are much more populations in the last year I cannot calculate the change for all of the populations, let's see how the plot will look like
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s9,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s9,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s9,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+          in the base model")
+
+#ggsave("Gen_sim_change_bm.png", 
+ #      path = "Plots/Appendix", 
+  #     width = 2099, height = 2099,
+   #    units = "px")
+#### Wildlife Corridor ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s99,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s99,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s99,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+          in the Wildlife Corridor scenario")
+#### Ecoducts ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s66,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s66,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s66,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years in the Ecoduct scenario")
+
+#### Translocation 1 ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s77,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s77,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s77,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+  in Translocation scenario 1")
+#### Translocation 2 ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s78,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s78,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s78,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+          in Translocation scenario 2")
+#### Translocation 3 ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s79,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s79,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s79,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+          in Translocation scenario 3")
+#### Translocation 4 ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s80,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s80,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s80,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+          in Translocation scenario 4")
+#### Translocation 5 ####
+ggplot() +
+  geom_raster(aes(x = long, y = lat, fill = id),
+              data = patches_df,
+              show.legend = F) + # don't show the legend of the patch map
+  scale_fill_gradientn(colours = c("grey")) +
+  geom_curve(aes(x = x, y = y, xend = xend, yend = yend, colour = change, size = change),
+             data = merged_sim_s81,
+             curvature = 0.2,
+             alpha = 1
+             ) +
+  scale_size_continuous(guide = FALSE, range = c(0, 1.5)) +
+  #scale_color_gradientn(colours = terrain.colors(10)) +
+  scale_colour_gradient(low = "firebrick3", high = "gold", limits = c(0, 4)) +
+  geom_point(aes(x = x, y = y), 
+             data = merged_sim_s81,
+             size = 10,
+             fill = "snow", color = "black",
+             shape = 21) +
+  geom_text(aes(x = x, y = y, label = Population1),
+            data = merged_sim_s81,
+            hjust = 0,
+            nudge_x = 40, nudge_y = 4,
+            size = 10,
+            color = "black",
+            fontface = "bold") +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 30, face = "bold")) +
+  theme(legend.position = "bottom") +
+  ggtitle("Relative change in genetic connectivity between European bison populations over 200 simulation years 
+          in Translocation scenario 5")
+```
+
+
+# Abundance & Occupancy 
+## Plots
+```{r}
+#### Scenario comparison ####
+##### Load data ####
+## Abundance
+abund_sens_scenarios <- bind_rows(
+  ## Scenario Base-model:
+  # The function readRange() runs in the background of plotAbundance(). Here, we extract abundances per scenario by hand.
+  readRange(s9low,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Do-nothing scenario"),
+  ## Wildlife Corridor Scenario
+    readRange(s_corridor, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Wildlife Corridor Scenario"),
+  ## Translocation Scenario
+    readRange(s_translocations, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Translocation Scenario 1"),
+  readRange(s_translocations2, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Translocation Scenario 2"),
+  readRange(s_translocations3, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Translocation Scenario 3"),
+  readRange(s_translocations4, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Translocation Scenario 4"),
+  readRange(s_translocations5, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Translocation Scenario 5"),
+    ## Ecoduct Scenario
+    readRange(s_ecoducts, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "Ecoduct Scenario")
+  )
+save(abund_sens_scenarios, file = "data/abund_sens_scenarios.RData")
+
+## Occupancy
+occ_sens_scenarios <- bind_rows(
+  ## Scenario Base-model:
+  # The function readRange() runs in the background of plotAbundance(). Here, we extract abundances per scenario by hand.
+  readRange(s9low,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Do-nothing scenario"),
+  ## Wildlife Corridor Scenario
+    readRange(s_corridor, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Wildlife Corridor Scenario"),
+  ## Translocation Scenario
+    readRange(s_translocations, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Translocation Scenario 1"),
+  readRange(s_translocations2, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Translocation Scenario 2"),
+  readRange(s_translocations3, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Translocation Scenario 3"),
+  readRange(s_translocations4, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Translocation Scenario 4"),
+  readRange(s_translocations5, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Translocation Scenario 5"),
+    ## Ecoduct Scenario
+    readRange(s_ecoducts, dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "Ecoduct Scenario")
+  )
+save(occ_sens_scenarios, file = "data/occ_sens_scenarios.RData")
+
+##### Plotting ####
+load("data/abund_sens_scenarios.RData")
+load("data/occ_sens_scenarios.RData")
+# Rename do-nothing scenario to base model
+abund_sens_scenarios <- abund_sens_scenarios %>%
+  mutate(Model = ifelse(Scenario == "Do-nothing scenario", "Base model", Scenario)) %>%
+  select(Year, Abundance, sd, Model)  
+
+occ_sens_scenarios <- occ_sens_scenarios %>%
+  mutate(Model = ifelse(Scenario == "Do-nothing scenario", "Base model", Scenario)) %>%
+  select(Year, Occupancy, sd, Model)  
+
+# Plot Abundance
+abund_plot <- ggplot(data = abund_sens_scenarios, mapping = aes(x = Year, y = Abundance,  color=Model)) + 
+  geom_line(linewidth=2) +
+  geom_ribbon(aes(ymin=Abundance-sd, ymax=Abundance+sd), linetype=2, alpha=0.1) +
+  xlim(20, 220) +
+    theme_minimal() +
+  theme(axis.title = element_text(size = 35),
+        axis.text = element_text(size = 35),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 35),
+        legend.text = element_text(size = 35),
+        #legend.key.size = unit(1.5, "cm"),
+        #legend.position = "bottom",
+        plot.title = element_text(size = 35, face = "bold"),
+        legend.background = element_rect(color = "black", fill = "white", size = 1, linetype = "solid")) +  # Add a box around the legend
+  ggtitle("European bison abundance over time across 
+          different management & restoration scenarios")
+abund_plot
+#ggsave(filename = "Plots/Abundance.png")
+
+# Plot occupancy
+occ_plot <- ggplot(data = occ_sens_scenarios, mapping = aes(x = Year, y = Occupancy,  color=Model)) + 
+  geom_line(linewidth=2) +
+  geom_ribbon(aes(ymin=Occupancy-sd, ymax=Occupancy+sd), linetype=2, alpha=0.1) +
+  xlim(20, 220) + 
+    theme_minimal() +
+  theme(axis.title = element_text(size = 35),
+        axis.text = element_text(size = 35),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 35),
+        legend.text = element_text(size = 35),
+        #legend.key.size = unit(1.5, "cm"),
+        #legend.position = "bottom",
+        plot.title = element_text(size = 35, face = "bold"),
+        legend.background = element_rect(color = "black", fill = "white", size = 1, linetype = "solid")) +  # Add a box around the legend
+  ggtitle("European bison occupancy probability over time across 
+          different management & restoration scenarios")
+occ_plot
+#ggsave(filename = "Plots/Occupancy.png")
+
+ggarrange(abund_plot, occ_plot,
+          labels = c("a)", "b)"),
+          font.label = list(size = 35, face = "bold"),
+          common.legend = T,
+          legend = "bottom")
+```
+## Occupancy probability map
+```{r}
+# Load data
+load("data/occ_sens_scenarios.RData")
+par(mfrow=c(1,1))
+#### Do-nothing ####
+col_s_bm <- ColonisationStats(s9low, dirpath, maps = T)
+names(col_s_bm)
+png(filename = "Plots/Appendix/col_map_bm.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_bm$map_occ_prob, add = T)
+title(main = "Occupancy probability map of the base model")
+dev.off()
+#### Wildlife Corridor ####
+col_s_corridor <- ColonisationStats(s_corridor, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_corridor.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_corridor$map_occ_prob, add = T)
+title(main = "Occupancy probability map of the Wildlife Corridor scenario")
+dev.off()
+#### Ecoduct scenario ####
+col_s_ecoducts <- ColonisationStats(s_ecoducts, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_ecoducts.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_ecoducts$map_occ_prob, add = T)
+title(main = "Occupancy probability map of the Ecoduct scenario")
+dev.off()
+#### Translocation scenario 1 ####
+col_s_t1 <- ColonisationStats(s_translocations, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_translocation1.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_t1$map_occ_prob, add = T)
+title(main = "Occupancy probability map of Translocation scenario 1")
+dev.off()
+#### Translocation scenario 2 ####
+col_s_t2 <- ColonisationStats(s_translocations2, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_translocation2.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_t2$map_occ_prob, add = T)
+title(main = "Occupancy probability map of Translocation scenario 2")
+dev.off()
+#### Translocation scenario 3 ####
+col_s_t3 <- ColonisationStats(s_translocations3, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_translocation3.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_t3$map_occ_prob, add = T)
+title(main = "Occupancy probability map of Translocation scenario 3")
+dev.off()
+#### Translocation scenario 4 ####
+col_s_t4 <- ColonisationStats(s_translocations4, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_translocation4.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_t4$map_occ_prob, add = T)
+title(main = "Occupancy probability map of Translocation scenario 4")
+dev.off()
+#### Translocation scenario 5 ####
+col_s_t5 <- ColonisationStats(s_translocations5, dirpath, maps = T)
+png(filename = "Plots/Appendix/col_map_translocation5.png", width = 1088, height = 766)
+plot(patches_spin, bg = "grey85", col = "grey85", legend = F)
+plot(col_s_t5$map_occ_prob, add = T)
+title(main = "Occupancy probability map of Translocation scenario 5")
+dev.off()
+```
+
+## Statistical tests
+### Abundance
+```{r}
+#### Preparation ####
+# When working from home load here abund_sens_scenarios.RData
+load("data/abund_sens_scenarios.RData")
+## Filter out starting and end Year
+abund_year_20 <- abund_sens_scenarios %>% filter(Year == 20)
+abund_year_220 <- abund_sens_scenarios %>% filter(Year == 220)
+## Merge on Scenario
+abund_merged <- merge(abund_year_20, abund_year_220, by = "Scenario", suffixes = c("_20", "_220"))
+## Calculate relative change 
+abund_merged <- abund_sens_scenarios %>%
+  mutate(Relative_abund = (Abundance/Abundance[abund_sens_scenarios$Year==0]))
+
+#### Relative Abundance model ####
+par(mfrow=c(1,1))
+hist(abund_merged$Relative_abund)
+ggplot(abund_merged, aes(x = Relative_abund, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", size = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Relative abundance", y = "Density") +
+  theme_minimal()
+## looks slightly left-skewed
+
+qqnorm(abund_merged$Relative_abund, col = "steelblue")
+qqline(abund_merged$Relative_abund, col = "red")
+shapiro.test(abund_merged$Relative_abund) #<0.001
+mean(abund_merged$Relative_abund) # 2.110907
+var(abund_merged$Relative_abund) # 0.3531846
+# Build model
+lm_log_abund <- lm(I(log(Relative_abund)) ~ Scenario*Year, data = abund_merged)
+summary(lm_log_abund)
+#Call:
+#lm(formula = I(log(Relative_abund)) ~ Scenario * Year, data = abund_merged)
+#
+#Residuals:
+#     Min       1Q   Median       3Q      Max 
+#-0.23965 -0.10253  0.02406  0.10409  0.15494 
+#
+#Coefficients:
+#                                          Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)                              1.920e-01  4.953e-02   3.876 0.000152 ***
+#ScenarioEcoduct Scenario                -1.063e-02  7.005e-02  -0.152 0.879624    
+#ScenarioTranslocation Scenario 1         4.832e-03  7.005e-02   0.069 0.945087    
+#ScenarioTranslocation Scenario 2        -7.669e-03  7.005e-02  -0.109 0.912951    
+#ScenarioTranslocation Scenario 3        -8.544e-05  7.005e-02  -0.001 0.999028    
+#ScenarioTranslocation Scenario 4        -7.199e-03  7.005e-02  -0.103 0.918268    
+#ScenarioTranslocation Scenario 5         4.722e-03  7.005e-02   0.067 0.946331    
+#ScenarioWildlife Corridor Scenario      -2.390e-03  7.005e-02  -0.034 0.972821    
+#Year                                     4.494e-03  3.856e-04  11.653  < 2e-16 ***
+#ScenarioEcoduct Scenario:Year            8.049e-05  5.453e-04   0.148 0.882839    
+#ScenarioTranslocation Scenario 1:Year    2.642e-05  5.453e-04   0.048 0.961417    
+#ScenarioTranslocation Scenario 2:Year    1.001e-04  5.453e-04   0.184 0.854613    
+#ScenarioTranslocation Scenario 3:Year    1.830e-04  5.453e-04   0.335 0.737678    
+#ScenarioTranslocation Scenario 4:Year    2.238e-04  5.453e-04   0.410 0.682085    
+#ScenarioTranslocation Scenario 5:Year    2.170e-04  5.453e-04   0.398 0.691181    
+#ScenarioWildlife Corridor Scenario:Year  2.319e-04  5.453e-04   0.425 0.671222    
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.1227 on 168 degrees of freedom
+#Multiple R-squared:  0.8729,	Adjusted R-squared:  0.8615 
+#F-statistic: 76.89 on 15 and 168 DF,  p-value: < 2.2e-16
+```
+### Occupancy
+```{r}
+#### Preparation ####
+load("data/occ_sens_scenarios.RData")
+## Filter out starting and end Year
+occ_year_20 <- occ_sens_scenarios %>% filter(Year == 20)
+occ_year_220 <- occ_sens_scenarios %>% filter(Year == 220)
+## Merge on Scenario
+occ_merged <- merge(occ_year_20, occ_year_220, by = "Scenario", suffixes = c("_20", "_220"))
+## Calculate relative change 
+occ_merged <- occ_sens_scenarios %>%
+  mutate(Relative_occ = (Occupancy/Occupancy[occ_sens_scenarios$Year==0]))
+
+#### Relative Occupancy model ####
+## Check distribution
+par(mfrow=c(1,1))
+hist(occ_merged$Relative_occ)
+ggplot(occ_merged, aes(x = Relative_occ, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", size = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Relative occupancy", y = "Density") +
+  theme_minimal()
+## slightly left-skewed --> quasipoisson()?
+qqnorm(occ_merged$Relative_occ, col = "steelblue")
+qqline(occ_merged$Relative_occ, col = "red")
+shapiro.test(occ_merged$Relative_occ) #<0.001
+mean(occ_merged$Relative_occ) # 1.548271
+var(occ_merged$Relative_occ) # 0.1034577
+
+# Build model
+lm_log_occ <- lm(I(log(Relative_occ)) ~ Scenario*Year, data = occ_merged)
+summary(lm_log_occ)
+#Call:
+#lm(formula = I(log(Relative_occ)) ~ Scenario * Year, data = occ_merged)
+#
+#Residuals:
+#     Min       1Q   Median       3Q      Max 
+#-0.17061 -0.06023  0.01710  0.06062  0.11593 
+#
+#Coefficients:
+#                                          Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)                              5.425e-02  3.094e-02   1.753   0.0814 .  
+#ScenarioEcoduct Scenario                 1.340e-03  4.376e-02   0.031   0.9756    
+#ScenarioTranslocation Scenario 1        -5.881e-03  4.376e-02  -0.134   0.8933    
+#ScenarioTranslocation Scenario 2        -3.835e-03  4.376e-02  -0.088   0.9303    
+#ScenarioTranslocation Scenario 3         9.319e-03  4.376e-02   0.213   0.8316    
+#ScenarioTranslocation Scenario 4         5.324e-03  4.376e-02   0.122   0.9033    
+#ScenarioTranslocation Scenario 5        -8.778e-03  4.376e-02  -0.201   0.8413    
+#ScenarioWildlife Corridor Scenario       1.150e-02  4.376e-02   0.263   0.7930    
+#Year                                     3.159e-03  2.409e-04  13.112   <2e-16 ***
+#ScenarioEcoduct Scenario:Year            4.115e-05  3.407e-04   0.121   0.9040    
+#ScenarioTranslocation Scenario 1:Year    2.092e-04  3.407e-04   0.614   0.5401    
+#ScenarioTranslocation Scenario 2:Year    7.515e-05  3.407e-04   0.221   0.8257    
+#ScenarioTranslocation Scenario 3:Year    7.356e-05  3.407e-04   0.216   0.8293    
+#ScenarioTranslocation Scenario 4:Year    1.434e-04  3.407e-04   0.421   0.6742    
+#ScenarioTranslocation Scenario 5:Year    1.153e-04  3.407e-04   0.338   0.7355    
+#ScenarioWildlife Corridor Scenario:Year  6.914e-05  3.407e-04   0.203   0.8394    
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.07664 on 168 degrees of freedom
+#Multiple R-squared:  0.8967,	Adjusted R-squared:  0.8875 
+#F-statistic:  97.2 on 15 and 168 DF,  p-value: < 2.2e-16
+```
+
+
+
+# TEST Dispersal Heat maps
+```{r}
+#### Wildlife Corridor ####
+# create a raster stack with all replicates as layers
+heatmaps_stack <- rast()
+for(rep in 0:(s_corridor@simul@Replicates-1)){
+    heatmaps_stack <- c(heatmaps_stack, 
+                               terra::rast(paste0(dirpath, "Output_Maps/Batch", 
+                                      s_corridor@control@batchnum, "_Sim", 
+                                      s_corridor@simul@Simulation, "_Land", 
+                                      s_corridor@land@LandNum,"_Rep",rep ,"_Visits.txt")))
+}
+
+# average over all layers
+heatmaps_mean <- mean(heatmaps_stack)
+
+# create exponential color scale
+res <- 20
+exp <- 3
+lim <- max(values(heatmaps_mean),na.rm = T)
+my.at <- seq(1,lim^(1/exp),length.out=res)^exp
+par(mfrow=c(1,1))
+plot(patches, legend = F)
+plot(heatmaps_mean,
+          col=hcl.colors(res, "Inferno", rev = T),
+          breaks = my.at, axes=F, type="continuous",
+     add = T)
+
+
+
+
+#### s9 ####
+heatmaps_stack9 <- rast()
+for(rep in 0:(s9low@simul@Replicates-1)){
+    heatmaps_stack9 <- c(heatmaps_stack9, 
+                               terra::rast(paste0(dirpath, "Output_Maps/Batch", 
+                                      s9low@control@batchnum, "_Sim", 
+                                      s9low@simul@Simulation, "_Land", 
+                                      s9low@land@LandNum,"_Rep",rep ,"_Visits.txt")))
+}
+
+# average over all layers
+heatmaps_mean9 <- mean(heatmaps_stack9)
+
+# create exponential color scale
+res <- 20
+exp <- 3
+lim <- max(values(heatmaps_mean9),na.rm = T)
+my.at <- seq(1,lim^(1/exp),length.out=res)^exp
+par(mfrow=c(1,1))
+plot(patches, legend = F)
+plot(heatmaps_mean9,
+          col=hcl.colors(res, "Inferno", rev = T),
+          breaks = my.at, axes=F, type="continuous",
+     add = T)
+
+#### s99 ####
+heatmaps_stack99 <- rast()
+for(rep in 0:(s_corridor@simul@Replicates-1)){
+    heatmaps_stack99 <- c(heatmaps_stack99, 
+                               terra::rast(paste0(dirpath, "Output_Maps/Batch", 
+                                      s_corridor@control@batchnum, "_Sim", 
+                                      s_corridor@simul@Simulation, "_Land", 
+                                      s_corridor@land@LandNum,"_Rep",rep ,"_Visits.txt")))
+}
+
+# average over all layers
+heatmaps_mean6 <- mean(heatmaps_stack99)
+plot(patches, legend = F)
+plot(heatmaps_mean6,
+          col=hcl.colors(res, "Inferno", rev = T),
+          breaks = my.at, axes=F, type="continuous",
+     add = T)
+```
+
+# Descriptives
+## Abundance & Occupancy
+### Abundance
+```{r}
+library(summarytools)
+summary_stats_abund <- subset(abund_sens_scenarios, Year == 220) %>%
+  select(Year, Abundance, Scenario) %>%
+  group_by(Year, Scenario) %>%
+  do(summarytools::descr(select(., Abundance), order = "sort", style = "rmarkdown", stats = "common", transpose = T))
+print(summary_stats_abund)
+```
+### Occupancy
+```{r}
+summary_stats_occ <- subset(occ_sens_scenarios, Year == 220) %>%
+  select(Year, Occupancy, sd, Scenario) %>%
+  group_by(Year, Scenario) %>%
+  do(summarytools::descr(select(., Occupancy), order = "sort", style = "rmarkdown", stats = "common", transpose = T))
+print(summary_stats_occ)
+```
+
+## Genetic similarity
+```{r}
+#### Avg. gen. sim ####
+summary_stats_gen_sim <- Avg_gen_sim_wide %>%
+  select(Scenario, Avg_Gen_sim_20, Avg_Gen_sim_210) %>%
+  group_by(Scenario) %>%
+  do(summarytools::descr(select(., Avg_Gen_sim_20, Avg_Gen_sim_210), stats = "common", transpose = T)) # transpose = T to handle possible NAs
+## The table now contains summary statistics for avg. genetic similarity in the first and last year for each scenario, always split into two columns. First column --> first year; last column --> last year
+print(summary_stats_gen_sim)
+
+#### Relative change ####
+summary_stats_change_gen_sim <- Gen_sim_all %>%
+  select(Model, `Genetic.Similarity.x`, `Genetic.Similarity.y`, Rel_gen_sim_200) %>%
+  group_by(Model) %>%
+  do(summarytools::descr(select(., `Genetic.Similarity.x`, `Genetic.Similarity.y`, Rel_gen_sim_200), stats = "common", transpose = T))
+print(summary_stats_change_gen_sim, n=24)
+
+#### Deviation from base-model (%) ####
+summary_stats_dev_bm <- Gen_sim_all %>%
+  select(Model, Deviation) %>%
+  group_by(Model) %>%
+  do(summarytools::descr(select(., Deviation), stats = "common", transpose = T))
+print(summary_stats_dev_bm)
+```
+## Allelic Diversity
+```{r}
+#### Average allelic diversity and relative change ####
+summary_stats_A <- Allelic_div_combined_relative %>%
+  select(Scenario, Year, Relative_A, Patch_Name) %>%
+  group_by(Scenario,Year,Patch_Name) %>%
+  do(summarytools::descr(select(., Relative_A), stats = "common", transpose = T)) %>%
+  filter(Year == 20 | Year == 210)
+
+
+
+#### Relative deviation from bm ####
+summary_stats_dev_A <- Allelic_div_combined_wide %>%
+  select(Scenario, Deviation) %>%
+  group_by(Scenario,) %>%
+  do(summarytools::descr(select(., Deviation), stats = "common", transpose = T))
+print(summary_stats_dev_A)
+
+```
+
+

@@ -1,0 +1,3054 @@
+---
+title: "Sensitivity_Analysis"
+author: "Tim Westermann"
+date: "2024-03-06"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+To explore sensitivity of model results, I will vary mean  fecundity, survival and dispersal (emigration) values. Hartway et al. (2020) altered them by ± 10%. Ovenden et al. (2019) altered survival and emigration parameters by ± 5%. As my survival values are already quite high, I think altering them by +10% would be a bit much (e.g. all of them would be just 1), so I will alter fecundity, survival and dispersal by ± 5% for each stage and sex separately (dispersal only per stage as probabilities are the same for both sexes) (Ovenden et al., 2019). Harem size will be altered by ± 10% (5% would be a difference of 0.5)
+
+# Load libraries
+```{r setup}
+# Specify knitting options, I only want code and no output
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+#
+library(RangeShiftR)
+library(tictoc)
+#library(latticeExtra)
+#library(rgdal)
+library(RColorBrewer)
+library(rasterVis)
+library(viridis)
+library(gridExtra)
+library(rgeos)
+library(raster)
+library(dplyr)
+library(terra)
+library(tidyr)
+library(poppr) # includes package adegenet needed for dist.genpop()
+library(purrr)
+library(tidyverse) #includes reshape2
+library(assertthat)
+library(igraph)
+library(ggplot2)
+library(ggraph)
+library(ggmap)
+library(data.table)
+#library(ggpubr)
+dirpath <- paste0("")
+```
+
+# Landscape settings
+```{r}
+model_number_pre <- 1
+#convert number to 3-digit string used for the folder
+model_number <- sprintf("%03d", model_number_pre)
+
+## load landscape files here to use in simulation as well as for mapping of results later on
+habitat <- raster("Inputs/Habitat.asc")
+#writeRaster(habitat, filename = "Inputs/habitat.txt", format = "ascii", overwrite = T)
+# Movement costs
+disp_cost <- raster("Inputs/disp_costs.asc")
+# Patch map
+patches <- raster("Inputs/patches.asc")
+#writeRaster(patches, filename = "Inputs/patches.txt", format = "ascii", overwrite = T)
+## Here I subset "patches" to only contain currently occupied patches (and the landscape itself) for the spin up period
+# First create patches_spin from patches
+patches_spin <- patches
+# Which population has which patch ID?
+# I must load in the patch file as a SpatRaster using the terra package to get patch IDs quickly. I don't want to overwrite "patches" so i load it in as "patches2"
+patches2 <- terra::rast("Inputs/patches.asc")
+plot(patches2)
+patches_pol <- as.polygons(patches2, dissolve=T) # Makes spatial polygons
+text(patches_pol,labels=values(patches_pol)[,1])
+# Now I define the values I want to keep
+#patches_to_keep <- c(NA, 0, 2, 4, 6, 15, 22, 23, 24, 73, 83, 109)  # Including NA and 0 (general landscape)
+patches_to_keep <- c(4, 6, 15, 23, 109, 22, 24, 83, 2, 73, 0, NA)
+# Subset
+patches_spin[!(patches_spin %in% patches_to_keep)] <- 0
+plot(patches_spin) # looks good
+# Save the subsetted raster layer to a new ascii file. I will then have to manually resave it to .txt file for further use!
+writeRaster(patches_spin, filename = "Inputs/patches_spin.txt", format = "ascii", overwrite = T)
+
+#### Build landscape modules for Baseline ####
+# Define"patchFilename"
+patchFilename <- c("patches_spin.asc", "patches.asc")
+# Define "landFilename" (must have the same number of entries as patch)
+landFilename <- c("Habitat.asc", "Habitat.asc") 
+# Redefine "costsFilename" (must have same number of entries as patch and landscape)
+costsFilename <- c("disp_costs.asc", "disp_costs.asc")
+
+land <- ImportedLandscape(LandscapeFile = landFilename, 
+                          Resolution = 1000, # cell size in meters
+                          HabPercent = T, # T = continuos values expected (0.0 - 100.0); represent % of habitat cover or quality
+                          K_or_DensDep = 0.01, # (Krasinska & Krasinski, 2013)
+                          PatchFile = patchFilename,
+                          DynamicLandYears = c(0, 20), # Define in which simulation year the patch maps should be loaded --> Spin up
+                          CostsFile = costsFilename)
+```
+
+# Demography settings
+```{r}
+#### Original ####
+# Transition matrix
+trans_mat <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for juvenile stage that only has one row for both sexes). First male, then female. 0.42 based on polish part of Bialowieza. In Belarussian part mean fecundity is 37.8% (0.378) (Krasinska & Krasinski, 2013)
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+# Stage structure
+stg <- StageStructure(Stages = 5, 
+                       TransMatrix = trans_mat,
+                       PRep = 1, # PRep = Probability of reproducing in subsequent reproductive seasons. 
+                       # typically females give birth to a calf once every 2-3 years which is already included in the fecundity
+                       MaxAge = 25,
+                       MinAge = c(0, #calves(for both sexes)
+                                  0, #male juveniles
+                                  0, #female juveniles
+                                  2, # male adolescents MAYBE 4 --> that's when bulls may have limited participation in breeding and recording of dispersal event (Krasinska & Krasinski, 2013)
+                                  2, # female adolescents MAYBE 3 --> that's when cows may have limited participation in breeding (Krasinska & Krasinski, 2013) Cows gives birth every 2 years (Krasinska & Krasinski, 2013)
+                                  6, #male rep. adults from Krasinska & Krasinski (2013)
+                                  4, #female rep. adults from Krasinska & Krasinski (2013)
+                                  13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                  20), #female sen. adults (Krasinska & Krasinski, 2013)
+                       SurvSched = 1,  ## 1=between reproductive events (as winter mortality main natural factor) (Krasinska & Krasinki, 2013)
+                       FecDensDep = T, # Coefficient is set in landscape module (K_or_DensDep)
+                       DevDensDep = F, 
+                       SurvDensDep = F)
+# Demography module
+demo <- Demography(StageStruct = stg,
+                   ReproductionType = 2, # was 0 in Hendriks model, but as I will be including genetics, I have to change it to 1 or 2 (maybe more realistic?)
+                   Harem = 10, # Bison have a polygynous mating system (one bull may mate with many females). However I have not found an estimate which I could use for harem size (which would be the maximum number of pair bonds a male Bison could establish). Hartway et al. (2020) set theirs to 10 but no justification..
+                   #animaldiversity.org states that groups/herds often consist of 10-12 individuals with 1 bull during the rut.
+                   PropMales = 0.5 
+                     ) 
+#### Altering Fecundity####
+# Altering fecundity by +5%
+trans_sen_p5fec <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.441, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes).
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+#Altering fecundity by -5%
+trans_sen_m5fec <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.399, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#### Altering Survival ####
+## Stage 1
+# Male
+# Altering MALE survival of Stage 1 by +5%
+trans_sen_p5s1m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.985, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+# Altering MALE survival of Stage 1 by -5%
+trans_sen_m5s1m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.891, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+# Female
+#Altering FEMALE survival of Stage 1 by +5%
+trans_sen_p5s1f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.980, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering FEMALE survival of Stage 1 by -5%
+trans_sen_m5s1f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.886, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+## Stage 2
+# Male 
+# Altering MALE Survival of stage 2 by +5%
+trans_sen_p5s2m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for juvenile stage that only has one row for both sexes). First male, then female. 0.42 based on polish part of Bialowieza. In Belarussian part mean fecundity is 37.8% (0.378) (Krasinska & Krasinski, 2013)
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.985, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+# Altering MALE survival of Stage 2 by -5%
+trans_sen_m5s2m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for juvenile stage that only has one row for both sexes). First male, then female. 0.42 based on polish part of Bialowieza. In Belarussian part mean fecundity is 37.8% (0.378) (Krasinska & Krasinski, 2013)
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, # male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, # female juvenile stage (non dispersing)
+                      0, 0, 0.891, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+# Female
+# Altering FEMALE survival of Stage 2 by +5%
+trans_sen_p5s2f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for juvenile stage that only has one row for both sexes). First male, then female. 0.42 based on polish part of Bialowieza. In Belarussian part mean fecundity is 37.8% (0.378) (Krasinska & Krasinski, 2013)
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.980, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+# Altering FEMALE Survival of Stage 2 by -5%
+trans_sen_m5s2f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for juvenile stage that only has one row for both sexes). First male, then female. 0.42 based on polish part of Bialowieza. In Belarussian part mean fecundity is 37.8% (0.378) (Krasinska & Krasinski, 2013)
+                            0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                            0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                            0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                            0, 0, 0, 0.886, 0, 0, 0, 0, 0, 0, # females
+                            0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                            0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                            0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                            0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                          ncol = 10, nrow = 9, byrow = TRUE)
+## Stage 3
+# Male 
+#Altering MALE survival of Stage 3 by +5%
+trans_sen_p5s3m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 1.000, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering MALE survival of Stage 3 by -5%
+trans_sen_m5s3m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.907, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+# Female
+#Altering FEMALE survival of Stage 3 by +5%
+trans_sen_p5s3f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 1.000, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering FEMALE survival of Stage 3 by -5%
+trans_sen_m5s3f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.928, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+## Stage 4
+# Male
+#Altering MALE survival of Stage 4 by +5%
+trans_sen_p5s4m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.998, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering MALE survival of Stage 4 by -5%
+trans_sen_m5s4m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.903, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+# Female
+#Altering FEMALE survival of Stage 4 by +5%
+trans_sen_p5s4f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 1.000, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering FEMALE survival of Stage 4 by -5%
+trans_sen_m5s4f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.934, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+## Stage 5
+# Male
+#Altering MALE survival of Stage 5 by +5%
+trans_sen_p5s5m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.998, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering MALE survival of Stage 5 by -5%
+trans_sen_m5s5m <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.903, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.95), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+# Female
+#Altering FEMALE survival of Stage 5 by +5%
+trans_sen_p5s5f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.998), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+#Altering FEMALE survival of Stage 5 by -5%
+trans_sen_m5s5f <- matrix(c(0, 0, 0, 0, 0, 0, 1, 0.42, 0, 0,   # two columns per stage to include both sexes (except for calve stage that only has one row for both sexes). 
+                      0.938, 0, 0, 0, 0, 0, 0, 0, 0, 0, ### male juvenile stage (non dispersing) 
+                      0, 0.933, 0, 0, 0, 0, 0, 0, 0, 0, ### female juvenile stage (non dispersing)
+                      0, 0, 0.938, 0, 0, 0, 0, 0, 0, 0, # males adolescents
+                      0, 0, 0, 0.933, 0, 0, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0.955, 0, 0, 0, 0, 0, # males reproductive adults
+                      0, 0, 0, 0, 0, 0.977, 0, 0, 0, 0, # females
+                      0, 0, 0, 0, 0, 0, 0.950, 0, 0.95, 0, # males senescent adults
+                      0, 0, 0, 0, 0, 0, 0, 0.983, 0, 0.903), # females       
+                    ncol = 10, nrow = 9, byrow = TRUE)
+
+
+
+#### Stage structure ####
+## Fecundity ##
+# +5%
+stg_sen_p5fec <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5fec,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# -5%
+stg_sen_m5fec <- StageStructure(Stages = 5, 
+                       TransMatrix = trans_sen_m5fec,
+                       PRep = 1, # PRep = Probability of reproducing in subsequent reproductive seasons. 
+                       # typically females give birth to a calf once every 2-3 years which is already included in the fecundity
+                       MaxAge = 25,
+                       MinAge = c(0, #calves(for both sexes)
+                                  0, #male juveniles
+                                  0, #female juveniles
+                                  2, # male adolescents MAYBE 4 --> that's when bulls may have limited participation in breeding and recording of dispersal event (Krasinska & Krasinski, 2013)
+                                  2, # female adolescents MAYBE 3 --> that's when cows may have limited participation in breeding (Krasinska & Krasinski, 2013) Cows gives birth every 2 years (Krasinska & Krasinski, 2013)
+                                  6, #male rep. adults from Krasinska & Krasinski (2013)
+                                  4, #female rep. adults from Krasinska & Krasinski (2013)
+                                  13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                  20), #female sen. adults (Krasinska & Krasinski, 2013)
+                       SurvSched = 1,  ## 1=between reproductive events (as winter mortality main natural factor) (Krasinska & Krasinki, 2013)
+                       FecDensDep = T, # Coefficient is set in landscape module (K_or_DensDep)
+                       DevDensDep = F, 
+                       SurvDensDep = F)
+
+## Survival ##
+## Stage 1
+# Male +5%
+stg_sen_p5s1m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s1m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Male -5%
+stg_sen_m5s1m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s1m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female +5%
+stg_sen_p5s1f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s1f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female -5%
+stg_sen_m5s1f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s1f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+## Stage 2
+# Male +5%
+stg_sen_p5s2m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s2m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Male -5%
+stg_sen_m5s2m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s2m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female +5%
+stg_sen_p5s2f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s2f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female -5%
+stg_sen_m5s2f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s2f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+## Stage 3
+# Male +5%
+stg_sen_p5s3m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s3m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Male -5%
+stg_sen_m5s3m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s3m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female +5%
+stg_sen_p5s3f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s3f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female -5%
+stg_sen_m5s3f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s3f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+## Stage 4
+# Male +5%
+stg_sen_p5s4m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s4m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Male -5%
+stg_sen_m5s4m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s4m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female +5%
+stg_sen_p5s4f <- StageStructure(Stages =5, 
+                      TransMatrix = trans_sen_p5s4f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female -5%
+stg_sen_m5s4f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s4f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+## Stage 5
+# Male +5%
+stg_sen_p5s5m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_p5s5m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Male -5%
+stg_sen_m5s5m <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s5m,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female +5%
+stg_sen_p5s5f <- StageStructure(Stages =5, 
+                      TransMatrix = trans_sen_p5s5f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+
+# Female -5%
+stg_sen_m5s5f <- StageStructure(Stages = 5, 
+                      TransMatrix = trans_sen_m5s5f,
+                      PRep = 1, 
+                      MaxAge = 25,
+                      MinAge = c(0, #calves(for both sexes)
+                                 0, #male juveniles
+                                 0, #female juveniles
+                                 2, # male adolescents 
+                                 2, # female adolescents 
+                                 6, #male rep. adults
+                                 4, #female rep. adults from Krasinska & Krasinski (2013)
+                                 13, #male sen. adults (from animaldiversity.org and Krasinska & Krasinski 2013)
+                                 20), #female sen. adults
+                      SurvSched = 1,
+                      FecDensDep = T,
+                      DevDensDep = F, 
+                      SurvDensDep = F)
+#### Demography module(s) ####
+## Fecundity ##
+# +5%
+demo_sen_p5fec <- Demography(StageStruct = stg_sen_p5fec,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# -5%
+demo_sen_m5fec <- Demography(StageStruct = stg_sen_m5fec,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+## Survival ##
+## Stage 1
+# Male +5%
+demo_sen_p5s1m <- Demography(StageStruct = stg_sen_p5s1m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Male -5%
+demo_sen_m5s1m <- Demography(StageStruct = stg_sen_m5s1m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female +5%
+demo_sen_p5s1f <- Demography(StageStruct = stg_sen_p5s1f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female -5%
+demo_sen_m5s1f <- Demography(StageStruct = stg_sen_m5s1f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+## Stage 2
+# Male +5%
+demo_sen_p5s2m <- Demography(StageStruct = stg_sen_p5s2m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Male -5%
+demo_sen_m5s2m <- Demography(StageStruct = stg_sen_m5s2m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female +5%
+demo_sen_p5s2f <- Demography(StageStruct = stg_sen_p5s2f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female -5%
+demo_sen_m5s2f <- Demography(StageStruct = stg_sen_m5s2f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+## Stage 3
+# Male +5%
+demo_sen_p5s3m <- Demography(StageStruct = stg_sen_p5s3m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Male -5%
+demo_sen_m5s3m <- Demography(StageStruct = stg_sen_m5s3m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     )
+# Female +5%
+demo_sen_p5s3f <- Demography(StageStruct = stg_sen_p5s3f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female -5%
+demo_sen_m5s3f <- Demography(StageStruct = stg_sen_m5s3f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+## Stage 4
+# Male +5%
+demo_sen_p5s4m <- Demography(StageStruct = stg_sen_p5s4m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Male -5%
+demo_sen_m5s4m <- Demography(StageStruct = stg_sen_m5s4m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     )
+# Female +5%
+demo_sen_p5s4f <- Demography(StageStruct = stg_sen_p5s4f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female -5%
+demo_sen_m5s4f <- Demography(StageStruct = stg_sen_m5s4f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+## Stage 5
+# Male +5%
+demo_sen_p5s5m <- Demography(StageStruct = stg_sen_p5s5m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Male -5%
+demo_sen_m5s5m <- Demography(StageStruct = stg_sen_m5s5m,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     )
+# Female +5%
+demo_sen_p5s5f <- Demography(StageStruct = stg_sen_p5s5f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     ) 
+# Female -5%
+demo_sen_m5s5f <- Demography(StageStruct = stg_sen_m5s5f,
+                   ReproductionType = 2,
+                   Harem = 10,
+                   PropMales = 0.5
+                     )
+```
+
+# Genetics settings
+```{r}
+#### Genetics module ####
+# In Hartway et al. (2020) paper, Allelic diversity under current management is predicted to decrease by 7.4%. I could not find ANYTHING on crossover probabilities that would give me a reference point for ProbCross so I think its wisest to leave it out (meaning its set to 0 by default)
+gen_mod <- Genetics(Architecture = 1, # 1 = read from file
+                    ArchFile = "genetic_architecture.txt",
+                    AlleleSD = 0.17 # This controls for the initial genetic variation, default is 0.1. I will have to play around with it to get an initital genetic variation that is close to reality (Olech et al., 2023: A = 2.7)
+                    )
+```
+
+# Dispersal settings
+```{r}
+D0_value_low <- 0.1
+D0_value_medium <- 0.25 
+D0_value_high <- 0.3
+
+# Beta_emig = inflection point of emigration probability curve - the lower this value the higher the dispersal activity! (or: already at lower pop densities individuals start dispersing)
+# low value here leads to a lot of dispersal happening initially from several populations (e.g., Bialowieza)
+Beta_emig_value_low <- 0.9 # Slope muss dann auf 20
+Beta_emig_value_medium <- 0.7 # Slope muss dann auf 15
+Beta_emig_value_high <- 0.5 # Slope muss dann auf 10
+
+#### Altering Emigration ####
+## Matrix ##
+## Original
+emig_mat <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+0.1*(1+0.05) # 0.105
+0.1*(1-0.05) # 0.095
+## Stage 2
+## Female
+# +5%
+emig_mat_sen_p5s2f <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,0.105,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+# -5%
+emig_mat_sen_m5s2f <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,0.095,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+## Male
+# +5%
+emig_mat_sen_p5s2m <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,0.105,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+# -5%
+emig_mat_sen_m5s2m <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,0.095,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+## Stage 3
+## Female
+# +5%
+emig_mat_sen_p5s3f <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,0.105,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+# -5%
+emig_mat_sen_m5s3f <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,0.095,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+## Male
+# +5%
+emig_mat_sen_p5s3m <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,0.105,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+# -5%
+emig_mat_sen_m5s3m <- matrix(c(0,0,0,0,0, # female calves
+                     0,1,0,0,0, # male
+                     1,0,0,0,0, # female juveniles
+                     1,1,0,0,0, # male
+                     2,0,D0_value_low,20,Beta_emig_value_low, # female adolescents
+                     2,1,D0_value_low,-20,Beta_emig_value_low, # male
+                     3,0,D0_value_low,20,Beta_emig_value_low, # female reproductive adults
+                     3,1,0.095,-20,Beta_emig_value_low, # male
+                     4,0,0,0,0, # female senescent adults
+                     4,1,0,0,0), # male 
+                   ncol = 5, byrow = T)
+
+## Emigration module ##
+## Original
+emigration_mod <- Emigration(EmigProb = emig_mat, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+## Stage 2
+## Female
+# +5%
+emigration_mod_sen_p5s2f <- Emigration(EmigProb = emig_mat_sen_p5s2f, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+# -5%
+emigration_mod_sen_m5s2f <- Emigration(EmigProb = emig_mat_sen_m5s2f, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+## Male
+# +5%
+emigration_mod_sen_p5s2m <- Emigration(EmigProb = emig_mat_sen_p5s2m, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+# -5%
+emigration_mod_sen_m5s2m <- Emigration(EmigProb = emig_mat_sen_m5s2m, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+## Stage 3
+## Female
+# +5%
+emigration_mod_sen_p5s3f <- Emigration(EmigProb = emig_mat_sen_p5s3f, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+# -5%
+emigration_mod_sen_m5s3f <- Emigration(EmigProb = emig_mat_sen_m5s3f, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+## Male
+# +5%
+emigration_mod_sen_p5s3m <- Emigration(EmigProb = emig_mat_sen_p5s3m, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             ) 
+# -5%
+emigration_mod_sen_m5s3m <- Emigration(EmigProb = emig_mat_sen_m5s3m, 
+                             StageDep = TRUE, 
+                             DensDep = TRUE,
+                             SexDep = TRUE
+                             )
+
+#### Transfer (SMS) ####
+# Transfer: The second phase of dispersal; consists of the movement of an individual departing from its natal patch towards a potential new patch, ending with settlement or mortality.
+transfer_mod <- SMS(PR = 1, # perceptual range of each individual for decision about next step, in number of cells
+                    PRMethod = 3, # use 1 (arithmetic mean) or 3 (weighted arithmetic mean), 3 might be better in reflecting actual barrier value
+                    MemSize = 2,
+                    DP = 2.5, # with higher DP (directional persistence) values, more straight line movements would occur, which do happen, but then barriers might also be more simply transgressed!
+                    Costs = "file", # cost raster map specified in landscape module (values>=1)
+                    StraightenPath = FALSE)
+
+#### Settlement ####
+## Matrix ##
+sett_mat <-matrix(c(0,1,-10,0.5, # females #S0, αS, βS | S0 is the maximum settlement probability; αS is the slope at the inflection point; βS is the inflection point
+                    1,1,10,0.5), #males 
+                    nrow=2, byrow = T) 
+
+## Settlement module ##
+sett_mod <- Settlement(StageDep = FALSE,
+                       SexDep = TRUE,
+                       Settle = sett_mat,
+                       FindMate = c(FALSE, TRUE), # females settle independent of males
+                       DensDep = TRUE, 
+                       MinSteps = c(0, 0),  # female | male
+                       MaxSteps = c(36, 2160),   # female | male; 
+                       MaxStepsYear = c(0, 0) # female | male
+                       ) 
+#### Dispersal module(s) ####
+## Original
+disp <-  Dispersal(Emigration = emigration_mod, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+## Stage 2
+## Female
+# +5%
+disp_sen_p5s2f <-  Dispersal(Emigration = emigration_mod_sen_p5s2f, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+# -5%
+disp_sen_m5s2f <-  Dispersal(Emigration = emigration_mod_sen_m5s2f, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+## Male
+# +5%
+disp_sen_p5s2m <-  Dispersal(Emigration = emigration_mod_sen_p5s2m, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+# -5%
+disp_sen_m5s2m <-  Dispersal(Emigration = emigration_mod_sen_m5s2m, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+## Stage 3
+## Female
+# +5%
+disp_sen_p5s3f <-  Dispersal(Emigration = emigration_mod_sen_p5s3f, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+# -5%
+disp_sen_m5s3f <-  Dispersal(Emigration = emigration_mod_sen_m5s3f, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+## Male
+# +5%
+disp_sen_p5s3m <-  Dispersal(Emigration = emigration_mod_sen_p5s3m, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+# -5%
+disp_sen_m5s3m <-  Dispersal(Emigration = emigration_mod_sen_m5s2m, 
+                   Transfer   = transfer_mod,
+                   Settlement = sett_mod)
+```
+
+# Initialisation settings
+```{r}
+init <- Initialise(InitType = 2, InitIndsFile = "init_pop2.txt")
+```
+
+# Simulation settings
+```{r}
+minR_value <- 0.259
+maxR_value <- 0.594 
+
+## Hartway et al. (2020) ran their VORTEX model for 200 years with 500 replicates
+sim <- Simulation(Simulation = 1,
+                  Replicates = 100,
+                  Years = 220,
+                  EnvStoch = 1, # 0=no, 1=activated
+                  EnvStochType = 0, # environmental stochasticity is applied to fecundity
+                  std = 0.155, # >0 and <=1.0 | SD of fecundity in Krasinska & Krasinski (2013)
+                  ac = 0, # 0-1 temporal autocorrelation coefficient of EnvStoch
+                  minR = minR_value,
+                  maxR = maxR_value,
+                  OutIntRange = 10,
+                  OutIntPop = 10,
+                  OutStartPop = 20,
+                  OutIntOcc = 10,
+                  OutIntPaths = 10,
+                  OutIntConn = 10,
+                  OutIntInd = 10,
+                  OutStartInd = 20,
+                  OutIntGenetic = 10, #Genetic output 
+                  OutStartGenetic = 20,
+                  OutGenType = 1, # 1 = all individuals
+                  OutGenCrossTab = T, # will generate genetics output as cross table
+                  SMSHeatMap = TRUE)
+# start output not before spinup (dynamic landscapes)  
+
+sim
+```
+
+# Parameter master
+```{r}
+#### Default ####
+batch_ID <- 1
+# Combine all modules in the parameter master object needed to run the simulation
+s <- RSsim(batchnum = 500,
+           simul = sim, land = land, demog = demo, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+saveRDS(s, paste0("Models/s_b", batch_ID, "_s", sim_ID, ".rds"))
+# Combine all modules in the parameter master object needed to run the simulation
+batchnum_sen <- 50
+#### Altered Fecundity ####
+# +5%
+s_sen1 <- RSsim(batchnum = 501,
+           simul = sim, land = land, demog = demo_sen_p5fec, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+s_sen1
+# -5%
+s_sen2 <- RSsim(batchnum = 502,
+           simul = sim, land = land, demog = demo_sen_m5fec, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+s_sen2
+#### Altered Survival ####
+## Stage 1
+# Male +5%
+s_sen3 <- RSsim(batchnum = 503,
+           simul = sim, land = land, demog = demo_sen_p5s1m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Male -5%
+s_sen4 <- RSsim(batchnum = 504,
+           simul = sim, land = land, demog = demo_sen_m5s1m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female +5%
+s_sen5 <- RSsim(batchnum = 505,
+           simul = sim, land = land, demog = demo_sen_p5s1f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female -5%
+s_sen6 <- RSsim(batchnum = 506,
+           simul = sim, land = land, demog = demo_sen_m5s1f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+## Stage 2
+# Male +5%
+s_sen7 <- RSsim(batchnum = 507,
+           simul = sim, land = land, demog = demo_sen_p5s2m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Male -5%
+s_sen8 <- RSsim(batchnum = 508,
+           simul = sim, land = land, demog = demo_sen_m5s2m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female +5%
+s_sen9 <- RSsim(batchnum = 509,
+           simul = sim, land = land, demog = demo_sen_p5s2f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female -5%
+s_sen10 <- RSsim(batchnum = 510,
+           simul = sim, land = land, demog = demo_sen_m5s2f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+## Stage 3
+# Male +5%
+s_sen11 <- RSsim(batchnum = 511,
+           simul = sim, land = land, demog = demo_sen_p5s3m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Male -5%
+s_sen12 <- RSsim(batchnum = 512,
+           simul = sim, land = land, demog = demo_sen_m5s3m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female +5%
+s_sen13 <- RSsim(batchnum = 513,
+           simul = sim, land = land, demog = demo_sen_p5s3f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female -5%
+s_sen14 <- RSsim(batchnum = 514,
+           simul = sim, land = land, demog = demo_sen_m5s3f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+## Stage 4
+# Male +5%
+s_sen15 <- RSsim(batchnum = 515,
+           simul = sim, land = land, demog = demo_sen_p5s4m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Male -5%
+s_sen16 <- RSsim(batchnum = 516,
+           simul = sim, land = land, demog = demo_sen_m5s4m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female +5%
+s_sen17 <- RSsim(batchnum = 517,
+           simul = sim, land = land, demog = demo_sen_p5s4f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female -5%
+s_sen18 <- RSsim(batchnum = 518,
+           simul = sim, land = land, demog = demo_sen_m5s4f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+## Stage 5
+# Male +5%
+s_sen19 <- RSsim(batchnum = 519,
+           simul = sim, land = land, demog = demo_sen_p5s5m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Male -5%
+s_sen20 <- RSsim(batchnum = 520,
+           simul = sim, land = land, demog = demo_sen_m5s5m, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female +5%
+s_sen21 <- RSsim(batchnum = 521,
+           simul = sim, land = land, demog = demo_sen_p5s5f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+# Female -5%
+s_sen22 <- RSsim(batchnum = 522,
+           simul = sim, land = land, demog = demo_sen_m5s5f, dispersal = disp, gene = gen_mod, init = init,
+           seed = 1909)
+
+#### Altered Dispersal ####
+## Stage 2
+## Female
+# +5%
+s_sen23 <- RSsim(batchnum = 523,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_p5s2f, gene = gen_mod, init = init,
+           seed = 1909)
+# -5%
+s_sen24 <- RSsim(batchnum = 524,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_m5s2f, gene = gen_mod, init = init,
+           seed = 1909)
+## Male
+# +5%
+s_sen25 <- RSsim(batchnum = 525,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_p5s2m, gene = gen_mod, init = init,
+           seed = 1909)
+# -5%
+s_sen26 <- RSsim(batchnum = 526,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_m5s2m, gene = gen_mod, init = init,
+           seed = 1909)
+## Stage 3
+## Female
+# +5%
+s_sen27 <- RSsim(batchnum = 527,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_p5s3f, gene = gen_mod, init = init,
+           seed = 1909)
+# -5%
+s_sen28 <- RSsim(batchnum = 528,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_m5s3f, gene = gen_mod, init = init,
+           seed = 1909)
+## Male
+# +5%
+s_sen29 <- RSsim(batchnum = 529,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_p5s3m, gene = gen_mod, init = init,
+           seed = 1909)
+# -5%
+s_sen30 <- RSsim(batchnum = 530,
+           simul = sim, land = land, demog = demo, dispersal = disp_sen_m5s3m, gene = gen_mod, init = init,
+           seed = 1909)
+#### Save sensitivity models ####
+## Save the parameter master object of the respective model run (needed to pull results later on)
+saveRDS(s_sen1, paste0("Models/s_b", batchnum_sen, "_s", 1, ".rds"))
+saveRDS(s_sen2, paste0("Models/s_b", batchnum_sen, "_s", 2, ".rds"))
+saveRDS(s_sen3, paste0("Models/s_b", batchnum_sen, "_s", 3, ".rds"))
+saveRDS(s_sen4, paste0("Models/s_b", batchnum_sen, "_s", 4, ".rds"))
+saveRDS(s_sen5, paste0("Models/s_b", batchnum_sen, "_s", 5, ".rds"))
+saveRDS(s_sen6, paste0("Models/s_b", batchnum_sen, "_s", 6, ".rds"))
+saveRDS(s_sen7, paste0("Models/s_b", batchnum_sen, "_s", 7, ".rds"))
+saveRDS(s_sen8, paste0("Models/s_b", batchnum_sen, "_s", 8, ".rds"))
+saveRDS(s_sen9, paste0("Models/s_b", batchnum_sen, "_s", 9, ".rds"))
+saveRDS(s_sen10, paste0("Models/s_b", batchnum_sen, "_s", 10, ".rds"))
+saveRDS(s_sen11, paste0("Models/s_b", batchnum_sen, "_s", 11, ".rds"))
+saveRDS(s_sen12, paste0("Models/s_b", batchnum_sen, "_s", 12, ".rds"))
+saveRDS(s_sen13, paste0("Models/s_b", batchnum_sen, "_s", 13, ".rds"))
+saveRDS(s_sen14, paste0("Models/s_b", batchnum_sen, "_s", 14, ".rds"))
+saveRDS(s_sen15, paste0("Models/s_b", batchnum_sen, "_s", 15, ".rds"))
+saveRDS(s_sen16, paste0("Models/s_b", batchnum_sen, "_s", 16, ".rds"))
+saveRDS(s_sen17, paste0("Models/s_b", batchnum_sen, "_s", 17, ".rds"))
+saveRDS(s_sen18, paste0("Models/s_b", batchnum_sen, "_s", 18, ".rds"))
+saveRDS(s_sen19, paste0("Models/s_b", batchnum_sen, "_s", 19, ".rds"))
+saveRDS(s_sen20, paste0("Models/s_b", batchnum_sen, "_s", 20, ".rds"))
+saveRDS(s_sen21, paste0("Models/s_b", batchnum_sen, "_s", 21, ".rds"))
+saveRDS(s_sen22, paste0("Models/s_b", batchnum_sen, "_s", 22, ".rds"))
+saveRDS(s_sen23, paste0("Models/s_b", batchnum_sen, "_s", 23, ".rds"))
+saveRDS(s_sen24, paste0("Models/s_b", batchnum_sen, "_s", 24, ".rds"))
+saveRDS(s_sen25, paste0("Models/s_b", batchnum_sen, "_s", 25, ".rds"))
+saveRDS(s_sen26, paste0("Models/s_b", batchnum_sen, "_s", 26, ".rds"))
+saveRDS(s_sen27, paste0("Models/s_b", batchnum_sen, "_s", 27, ".rds"))
+saveRDS(s_sen28, paste0("Models/s_b", batchnum_sen, "_s", 28, ".rds"))
+saveRDS(s_sen29, paste0("Models/s_b", batchnum_sen, "_s", 29, ".rds"))
+saveRDS(s_sen30, paste0("Models/s_b", batchnum_sen, "_s", 30, ".rds"))
+```
+
+# Run simulations (Run this on cluster as it takes very long!)
+```{r}
+#### Base-model ####
+#RunRS(s, dirpath)
+#### Fecundity ####
+#RunRS(s_sen1,dirpath)
+#RunRS(s_sen2,dirpath)
+#### Survival ####
+#RunRS(s_sen3,dirpath)
+#RunRS(s_sen4,dirpath)
+#RunRS(s_sen5, dirpath)
+#RunRS(s_sen6, dirpath)
+#RunRS(s_sen7, dirpath)
+#RunRS(s_sen8, dirpath)
+#RunRS(s_sen9, dirpath)
+#RunRS(s_sen10, dirpath)
+#RunRS(s_sen11, dirpath)
+#RunRS(s_sen12, dirpath)
+#RunRS(s_sen13, dirpath)
+#RunRS(s_sen14, dirpath)
+#RunRS(s_sen15, dirpath)
+#RunRS(s_sen16, dirpath)
+#RunRS(s_sen17, dirpath)
+#RunRS(s_sen18, dirpath)
+#RunRS(s_sen19, dirpath)
+#RunRS(s_sen20, dirpath)
+#RunRS(s_sen21, dirpath)
+#RunRS(s_sen22, dirpath)
+#### Dispersal ####
+#RunRS(s_sen23, dirpath)
+#RunRS(s_sen24, dirpath)
+#RunRS(s_sen25, dirpath)
+#RunRS(s_sen26, dirpath)
+#RunRS(s_sen27, dirpath)
+#RunRS(s_sen28, dirpath)
+#RunRS(s_sen29, dirpath)
+#RunRS(s_sen30, dirpath)
+```
+
+# Create overview plots and DFs sensitivity scenarios
+## Abundance
+```{r}
+####  Load abundances ####
+## Fecundity
+# Join mean (and sd) of abundances over all static scenarios in a single data frame
+abund_sens_fec <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotAbundance(). Here, we extract abundances per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "0 - Default"), 
+  # Sensitivity 1
+  readRange(s_sen1,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "1 - Fecundity +5%"), 
+  # Sensitivity 2
+  readRange(s_sen2,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "2 - Fecundity -5%")
+  ) 
+
+## Survival
+abund_sens_surv <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotAbundance(). Here, we extract abundances per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "0 - Default"), 
+# Sensitivity 3
+  readRange(s_sen3,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "3 - Survival S1M +5%"),
+  # Sensitivity 4
+  readRange(s_sen4,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "4 - Survival S1M -5%"), 
+  # Sensitivity 5
+  readRange(s_sen5,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "5 - Survival S1F +5%"), 
+  # Sensitivity 6
+  readRange(s_sen6,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "6 - Survival S1F -5%"),
+  # Sensitivity 7
+  readRange(s_sen7,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "7 - Survival S2M +5%"),
+  # Sensitivity 8
+  readRange(s_sen8,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "8 - Survival S2M -5%"),
+  # Sensitivity 9
+  readRange(s_sen9,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "9 - Survival S2F +5%"),
+  # Sensitivity 10
+  readRange(s_sen10,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "10 - Survival S2F -5%"),
+  # Sensitivity 11
+  readRange(s_sen11,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "11 - Survival S3M +5%"),
+  # Sensitivity 12
+  readRange(s_sen12,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "12 - Survival S3M -5%"),
+    # Sensitivity 13
+  readRange(s_sen13,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "13 - Survival S3F +5%"),
+    # Sensitivity14
+  readRange(s_sen14,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "14 - Survival S3F -5%"),
+    # Sensitivity 15
+  readRange(s_sen15,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "15 - Survival S4M +5%"),
+    # Sensitivity 16
+  readRange(s_sen16,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "16 - Survival S4M -5%"),
+    # Sensitivity 17
+  readRange(s_sen17,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "17 - Survival S4F +5%"),
+    # Sensitivity 18
+  readRange(s_sen18,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "18 - Survival S4F -5%"),
+# Sensitivity 19
+  readRange(s_sen19,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "19 - Survival S5M +5%"),
+# Sensitivity 20
+  readRange(s_sen20,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "20 - Survival S5M -5%"),
+# Sensitivity 21
+  readRange(s_sen21,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "21 - Survival S5F +5%"),
+# Sensitivity 22
+  readRange(s_sen22,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "22 - Survival S5F -5%")
+  )
+
+## Dispersal
+abund_sens_disp <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotAbundance(). Here, we extract abundances per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "0 - Default"), 
+  # Sensitivity 23
+  readRange(s_sen23,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "23 - Dispersal S2F +5%"),
+  # Sensitivity 24
+  readRange(s_sen24,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "24 - Dispersal S2F -5%"), 
+  # Sensitivity 25
+  readRange(s_sen25,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "25 - Dispersal S2M +5%"), 
+  # Sensitivity 26
+  readRange(s_sen26,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "26 - Dispersal S2M -5%"),
+  # Sensitivity 27
+  readRange(s_sen27,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "27 - Dispersal S3F +5%"),
+  # Sensitivity 28
+  readRange(s_sen28,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "28 - Dispersal S3F -5%"),
+  # Sensitivity 29
+  readRange(s_sen29,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "29 - Dispersal S3M +5%"),
+  # Sensitivity 30
+  readRange(s_sen30,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "30 - Dispersal S3M -5%")
+)
+## Harem size
+# Join mean (and sd) of abundances over all static scenarios in a single data frame
+abund_sens_harem <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotAbundance(). Here, we extract abundances per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "0 - Default"), 
+  # Sensitivity 31
+  readRange(s_sen31,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "31 - Harem size + 10%"), 
+  # Sensitivity 2
+  readRange(s_sen32,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Abundance = mean(NInds), sd = sd(NInds)) %>% add_column(Scenario = "32 - Harem size - 10%")
+) 
+#### Plotting ####
+# Set color palette for scenarios excluding "Scenario 0 - Default"
+scenario_colors_fec <- rainbow(length(unique(abund_sens_fec$Scenario)) - 1)
+scenario_colors_surv <- rainbow(length(unique(abund_sens_surv$Scenario)) - 1)
+scenario_colors_disp <- rainbow(length(unique(abund_sens_disp$Scenario)) - 1)
+scenario_colors_harem <- rainbow(length(unique(abund_sens_harem$Scenario)) - 1)
+# Set color for "Scenario 0 - Default" to black
+scenario_colors_fec <- c("black", scenario_colors_fec)
+scenario_colors_surv <- c("black", scenario_colors_surv)
+scenario_colors_disp <- c("black", scenario_colors_disp)
+scenario_colors_harem <- c("black", scenario_colors_harem)
+
+# Define the order of scenarios
+scenario_order_fec <- c("0 - Default", 
+                    "1 - Fecundity +5%", 
+                    "2 - Fecundity -5%" 
+                    )
+
+scenario_order_surv <- c("0 - Default",
+                         "3 - Survival S1M +5%", 
+                    "4 - Survival S1M -5%", 
+                    "5 - Survival S1F +5%", 
+                    "6 - Survival S1F -5%", 
+                    "7 - Survival S2M +5%", 
+                    "8 - Survival S2M -5%", 
+                    "9 - Survival S2F +5%", 
+                    "10 - Survival S2F -5%", 
+                    "11 - Survival S3M +5%", 
+                    "12 - Survival S3M -5%", 
+                    "13 - Survival S3F +5%", 
+                    "14 - Survival S3F -5%", 
+                    "15 - Survival S4M +5%", 
+                    "16 - Survival S4M -5%", 
+                    "17 - Survival S4F +5%", 
+                    "18 - Survival S4F -5%",
+                    "19 - Survival S5M +5%", 
+                    "20 - Survival S5M -5%", 
+                    "21 - Survival S5F +5%", 
+                    "22 - Survival S5F -5%")
+
+scenario_order_disp <- c("0 - Default",
+                         "23 - Dispersal S2F +5%", 
+                    "24 - Dispersal S2F -5%", 
+                    "25 - Dispersal S2M +5%", 
+                    "26 - Dispersal S2M -5%", 
+                    "27 - Dispersal S3F +5%", 
+                    "28 - Dispersal S3F -5%", 
+                    "29 - Dispersal S3M +5%", 
+                    "30 - Dispersal S3M -5%")
+
+scenario_order_harem <- c("0 - Default",
+                         "31 - Harem size + 10%",
+                         "32 - Harem size - 10%")
+
+# Convert Scenario to factor with desired levels
+abund_sens_fec$Scenario <- factor(abund_sens_fec$Scenario, levels = scenario_order_fec)
+abund_sens_surv$Scenario <- factor(abund_sens_surv$Scenario, levels = scenario_order_surv)
+abund_sens_disp$Scenario <- factor(abund_sens_disp$Scenario, levels = scenario_order_disp)
+abund_sens_harem$Scenario <- factor(abund_sens_harem$Scenario, levels = scenario_order_harem)
+# Remove rows with NA in the Scenario column
+#abund_sens <- abund_sens[!is.na(abund_sens$Scenario), ]
+## Fecundity
+ggplot(data = abund_sens_fec, mapping = aes(x = Year, y = Abundance, color = Scenario)) + 
+  geom_line(size = 2) +
+  geom_ribbon(aes(ymin = Abundance - sd, ymax = Abundance + sd), linetype = 2, alpha = 0.1) +
+  scale_color_manual(values = scenario_colors_fec) +
+  scale_fill_discrete(breaks = abund_sens$Scenario)
+
+ggsave(filename = "Plots/Sensitivity_Analysis/Fecundity_Abundance.png")
+
+## Survival
+ggplot(data = abund_sens_surv, mapping = aes(x = Year, y = Abundance, color = Scenario)) + 
+  geom_line(size = 2) +
+  geom_ribbon(aes(ymin = Abundance - sd, ymax = Abundance + sd), linetype = 2, alpha = 0.1) +
+  scale_color_manual(values = scenario_colors_surv) +
+  scale_fill_discrete(breaks = abund_sens$Scenario)
+
+ggsave(filename = "Plots/Sensitivity_Analysis/Survival_Abundance.png")
+
+## Dispersal
+ggplot(data = abund_sens_disp, mapping = aes(x = Year, y = Abundance, color = Scenario)) + 
+  geom_line(size = 2) +
+  geom_ribbon(aes(ymin = Abundance - sd, ymax = Abundance + sd), linetype = 2, alpha = 0.1) +
+  scale_color_manual(values = scenario_colors_disp) +
+  scale_fill_discrete(breaks = abund_sens$Scenario)
+
+ggsave(filename = "Plots/Sensitivity_Analysis/Dispersal_Abundance.png")
+
+#### Comparison calculation ####
+# Merge dfs
+df_list <- list(abund_sens_fec, abund_sens_surv, abund_sens_disp, abund_sens_harem)
+abund_sens <- Reduce(function(x, y) merge(x, y, all = T), df_list)
+# Calculate abundance after 210 years for each scenario
+abundance_after_210 <- abund_sens %>%
+  filter(Year == 20 | Year == 220) %>%
+  select(Scenario, Year, Abundance)
+
+# Calculate relative values
+abundance_after_210 <- abundance_after_210 %>%
+  group_by(Scenario) %>%
+  mutate(Rel_abund_220 = Abundance / Abundance[Year == 20]) %>%
+  filter(Year == 220)
+
+abundance_after_210$Rel_abund_S0 <- abundance_after_210$Rel_abund_220[abundance_after_210$Scenario=="0 - Default"]
+
+# Calculate the deviation percentage
+abundance_after_210 <- abundance_after_210 %>%
+  mutate(Deviation = (Rel_abund_220 / Rel_abund_S0))
+# Calculate SE
+abundance_after_210 <- abundance_after_210 %>%
+  mutate(SE = (sd(Deviation_Percentage)/sqrt(length(Deviation_Percentage))))
+# Calculate t/z value
+abundance_after_210 <- abundance_after_210 %>%
+  mutate(t = Deviation_Percentage/SE)
+# Print the dataframe with comparison
+print(abundance_after_210)
+
+save(abundance_after_210, file = "data/abundance_sensitivity.RData")
+
+### check literature on variability in Bison survival rates
+```
+
+## Occupancy
+```{r}
+####  Load occupancy ####
+## Fecundity
+# Join mean (and sd) of abundances over all static scenarios in a single data frame
+occ_sens_fec <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotOccupancy(). Here, we extract Occupancys per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "0 - Default"), 
+  # Sensitivity 1
+  readRange(s_sen1,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "1 - Fecundity +5%"), 
+  # Sensitivity 2
+  readRange(s_sen2,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "2 - Fecundity -5%")
+  ) 
+
+## Survival
+occ_sens_surv <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotOccupancy(). Here, we extract Occupancys per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "0 - Default"), 
+# Sensitivity 3
+  readRange(s_sen3,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "3 - Survival S1M +5%"),
+  # Sensitivity 4
+  readRange(s_sen4,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "4 - Survival S1M -5%"), 
+  # Sensitivity 5
+  readRange(s_sen5,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "5 - Survival S1F +5%"), 
+  # Sensitivity 6
+  readRange(s_sen6,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "6 - Survival S1F -5%"),
+  # Sensitivity 7
+  readRange(s_sen7,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "7 - Survival S2M +5%"),
+  # Sensitivity 8
+  readRange(s_sen8,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "8 - Survival S2M -5%"),
+  # Sensitivity 9
+  readRange(s_sen9,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "9 - Survival S2F +5%"),
+  # Sensitivity 10
+  readRange(s_sen10,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "10 - Survival S2F -5%"),
+  # Sensitivity 11
+  readRange(s_sen11,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "11 - Survival S3M +5%"),
+  # Sensitivity 12
+  readRange(s_sen12,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "12 - Survival S3M -5%"),
+    # Sensitivity 13
+  readRange(s_sen13,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "13 - Survival S3F +5%"),
+    # Sensitivity14
+  readRange(s_sen14,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "14 - Survival S3F -5%"),
+    # Sensitivity 15
+  readRange(s_sen15,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "15 - Survival S4M +5%"),
+    # Sensitivity 16
+  readRange(s_sen16,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "16 - Survival S4M -5%"),
+    # Sensitivity 17
+  readRange(s_sen17,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "17 - Survival S4F +5%"),
+    # Sensitivity 18
+  readRange(s_sen18,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "18 - Survival S4F -5%"),
+# Sensitivity 19
+  readRange(s_sen19,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "19 - Survival S5M +5%"),
+# Sensitivity 20
+  readRange(s_sen20,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "20 - Survival S5M -5%"),
+# Sensitivity 21
+  readRange(s_sen21,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "21 - Survival S5F +5%"),
+# Sensitivity 22
+  readRange(s_sen22,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "22 - Survival S5F -5%")
+  )
+
+## Dispersal
+occ_sens_disp <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotOccupancy(). Here, we extract Occupancys per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "0 - Default"), 
+  # Sensitivity 23
+  readRange(s_sen23,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "23 - Dispersal S2F +5%"),
+  # Sensitivity 24
+  readRange(s_sen24,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "24 - Dispersal S2F -5%"), 
+  # Sensitivity 25
+  readRange(s_sen25,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "25 - Dispersal S2M +5%"), 
+  # Sensitivity 26
+  readRange(s_sen26,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "26 - Dispersal S2M -5%"),
+  # Sensitivity 27
+  readRange(s_sen27,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "27 - Dispersal S3F +5%"),
+  # Sensitivity 28
+  readRange(s_sen28,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "28 - Dispersal S3F -5%"),
+  # Sensitivity 29
+  readRange(s_sen29,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "29 - Dispersal S3M +5%"),
+  # Sensitivity 30
+  readRange(s_sen30,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "30 - Dispersal S3M -5%")
+)
+## Harem
+# Join mean (and sd) of abundances over all static scenarios in a single data frame
+occ_sens_harem <- bind_rows(
+  # Default:
+  # The function readRange() runs in the background of plotOccupancy(). Here, we extract Occupancys per scenario by hand
+  readRange(s,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "0 - Default"), 
+  # Sensitivity 1
+  readRange(s_sen31,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "31 - Harem size + 10%"), 
+  # Sensitivity 2
+  readRange(s_sen32,dirpath) %>%
+    group_by(Year) %>%
+    summarise(Occupancy = mean(NOccupPatches), sd = sd(NOccupPatches)) %>% add_column(Scenario = "32 - Harem size - 10%")
+) 
+#### Plotting ####
+# Set color palette for scenarios excluding "Scenario 0 - Default"
+scenario_colors_fec <- rainbow(length(unique(occ_sens_fec$Scenario)) - 1)
+scenario_colors_surv <- rainbow(length(unique(occ_sens_surv$Scenario)) - 1)
+scenario_colors_disp <- rainbow(length(unique(occ_sens_disp$Scenario)) - 1)
+scenario_colors_harem <- rainbow(length(unique(occ_sens_harem$Scenario)) - 1)
+# Set color for "Scenario 0 - Default" to black
+scenario_colors_fec <- c("black", scenario_colors_fec)
+scenario_colors_surv <- c("black", scenario_colors_surv)
+scenario_colors_disp <- c("black", scenario_colors_disp)
+scenario_colors_harem <- c("black", scenario_colors_harem)
+
+# Define the order of scenarios
+scenario_order_fec <- c("0 - Default", 
+                    "1 - Fecundity +5%", 
+                    "2 - Fecundity -5%" 
+                    )
+
+scenario_order_surv <- c("0 - Default",
+                         "3 - Survival_S1M +5%", 
+                    "4 - Survival S1M -5%", 
+                    "5 - Survival S1F +5%", 
+                    "6 - Survival S1F -5%", 
+                    "7 - Survival S2M +5%", 
+                    "8 - Survival S2M -5%", 
+                    "9 - Survival S2F +5%", 
+                    "10 - Survival S2F -5%", 
+                    "11 - Survival S3M +5%", 
+                    "12 - Survival S3M -5%", 
+                    "13 - Survival S3F +5%", 
+                    "14 - Survival S3F -5%", 
+                    "15 - Survival S4M +5%", 
+                    "16 - Survival S4M -5%", 
+                    "17 - Survival S4F +5%", 
+                    "18 - Survival S4F -5%",
+                    "19 - Survival S5M +5%", 
+                    "20 - Survival S5M -5%", 
+                    "21 - Survival S5F +5%", 
+                    "22 - Survival S5F -5%")
+
+scenario_order_disp <- c("0 - Default",
+                         "23 - Dispersal S2F +5%", 
+                    "24 - Dispersal S2F -5%", 
+                    "25 - Dispersal S2M +5%", 
+                    "26 - Dispersal S2M -5%", 
+                    "27 - Dispersal S3F +5%", 
+                    "28 - Dispersal S3F -5%", 
+                    "29 - Dispersal S3M +5%", 
+                    "30 - Dispersal S3M -5%")
+
+scenario_order_harem <- c("0 - Default", 
+                        "31 - Harem size + 10%", 
+                        "32 - Harem size - 10%" 
+)
+
+# Convert Scenario to factor with desired levels
+occ_sens_fec$Scenario <- factor(occ_sens_fec$Scenario, levels = scenario_order_fec)
+occ_sens_surv$Scenario <- factor(occ_sens_surv$Scenario, levels = scenario_order_surv)
+occ_sens_disp$Scenario <- factor(occ_sens_disp$Scenario, levels = scenario_order_disp)
+occ_sens_harem$Scenario <- factor(occ_sens_harem$Scenario, levels = scenario_order_harem)
+# Remove rows with NA in the Scenario column
+#occ_sens <- occ_sens[!is.na(occ_sens$Scenario), ]
+## Fecundity
+ggplot(data = occ_sens_fec, mapping = aes(x = Year, y = Occupancy, color = Scenario)) + 
+  geom_line(linewidth = 2) +
+  geom_ribbon(aes(ymin = Occupancy - sd, ymax = Occupancy + sd), linetype = 2, alpha = 0.1) +
+  scale_color_manual(values = scenario_colors_fec) +
+  scale_fill_discrete(breaks = occ_sens$Scenario)
+
+ggsave(filename = "Plots/Sensitivity_Analysis/Fecundity_Occupancy.png")
+
+## Survival
+ggplot(data = occ_sens_surv, mapping = aes(x = Year, y = Occupancy, color = Scenario)) + 
+  geom_line(linewidth = 2) +
+  geom_ribbon(aes(ymin = Occupancy - sd, ymax = Occupancy+ sd), linetype = 2, alpha = 0.1) +
+  scale_color_manual(values = scenario_colors_surv) +
+  scale_fill_discrete(breaks = abund_sens$Scenario)
+
+ggsave(filename = "Plots/Sensitivity_Analysis/Survival_Occupancy.png")
+
+## Dispersal
+ggplot(data = occ_sens_disp, mapping = aes(x = Year, y = Occupancy, color = Scenario)) + 
+  geom_line(linewidth = 2) +
+  geom_ribbon(aes(ymin = Occupancy - sd, ymax = Occupancy + sd), linetype = 2, alpha = 0.1) +
+  scale_color_manual(values = scenario_colors_disp) +
+  scale_fill_discrete(breaks = abund_sens$Scenario)
+
+ggsave(filename = "Plots/Sensitivity_Analysis/Dispersal_Occupancy.png")
+
+
+#### Comparison calculation ####
+# Merge dfs
+df_list <- list(occ_sens_fec, occ_sens_surv, occ_sens_disp, occ_sens_harem)
+occ_sens <- Reduce(function(x, y) merge(x, y, all = T), df_list)
+# Calculate abundance after 210 years for each scenario
+occupancy_after_210 <- occ_sens %>%
+  filter(Year == 20 | Year == 220) %>%
+  select(Scenario, Year, Occupancy)
+
+# Calculate relative values
+occupancy_after_210 <- occupancy_after_210 %>%
+  group_by(Scenario) %>%
+  mutate(Rel_occ_220 = Occupancy / Occupancy[Year == 20]) %>%
+  filter(Year == 220)
+
+occupancy_after_210$Rel_occ_S0 <- occupancy_after_210$Rel_occ_220[occupancy_after_210$Scenario=="0 - Default"]
+
+# Calculate the deviation percentage
+occupancy_after_210 <- occupancy_after_210 %>%
+  mutate(Deviation = (Rel_occ_220 / Rel_occ_S0))
+# Calculate SE
+occupancy_after_210 <- occupancy_after_210 %>%
+  mutate(SE = (sd(Deviation_Percentage)/sqrt(length(Deviation_Percentage))))
+# Calculate t/z value
+occupancy_after_210 <- occupancy_after_210 %>%
+  mutate(t = Deviation_Percentage/SE)
+# Print the dataframe with comparison
+print(occupancy_after_210)
+
+save(occupancy_after_210, file = "data/occupancy_sensitivity.RData")
+
+```
+
+# Compare scenarios
+## Abundance & Occupancy
+```{r}
+library(ggplot2)
+load("data/abundance_sensitivity.RData")
+load("data/occupancy_sensitivity.RData")
+
+abundance_after_210$Deviation_Type <- ifelse(abundance_after_210$Deviation < 1, "Negative", "Positive")
+occupancy_after_210$Deviation_Type <- ifelse(occupancy_after_210$Deviation < 1, "Negative", "Positive")
+
+# Sort scenarios
+## Add a new column "Scenario"
+scenario <- c(
+  "0 - Default",
+  "1 - Fecundity +5%",
+  "2 - Fecundity -5%",
+  "3 - Survival S1M +5%",
+  "4 - Survival S1M -5%",
+  "5 - Survival S1F +5%",
+  "6 - Survival S1F -5%",
+  "7 - Survival S2M +5%",
+  "8 - Survival S2M -5%",
+  "9 - Survival S2F +5%",
+  "10 - Survival S2F -5%",
+  "11 - Survival S3M +5%",
+  "12 - Survival S3M -5%",
+  "13 - Survival S3F +5%",
+  "14 - Survival S3F -5%",
+  "15 - Survival S4M +5%",
+  "16 - Survival S4M -5%",
+  "17 - Survival S4F +5%",
+  "18 - Survival S4F -5%",
+  "19 - Survival S5M +5%",
+  "20 - Survival S5M -5%",
+  "21 - Survival S5F +5%",
+  "22 - Survival S5F -5%",
+  "23 - Dispersal S2F +5%",
+  "24 - Dispersal S2F -5%",
+  "25 - Dispersal S2M +5%",
+  "26 - Dispersal S2M -5%",
+  "27 - Dispersal S3F +5%",
+  "28 - Dispersal S3F -5%",
+  "29 - Dispersal S3M +5%",
+  "30 - Dispersal S3M -5%",
+  "31 - Harem size + 10%",
+  "32 - Harem size - 10%"
+)
+abundance_after_210$Scenario <- factor(abundance_after_210$Scenario, levels = scenario)
+occupancy_after_210$Scenario <- factor(occupancy_after_210$Scenario, levels = scenario)
+#### Abundance ####
+##### diverging bar chart #####
+attach(abundance_after_210)
+ggplot(data = subset(abundance_after_210, Scenario != "0 - Default"),
+       aes(x = Deviation, y = Scenario, fill = Deviation_Type)) +
+  geom_bar(stat = "identity", width = 0.5) + 
+  scale_fill_manual(values = c("cyan3", "orange"), guide = F) +
+  xlab("Deviation in abundance from base-model in %") +
+  ylab("Sensitivity model") +
+  ggtitle("Deviation in Abundance from the base model between 
+          sensitivity models") +
+  theme_minimal()
+# save plot
+#ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_Abundance_Bar.png", width = 2099, height = 2099, unit = "px")
+
+##### Diverging lollipop plot #####
+Dev_abund <- ggplot(data = subset(abundance_after_210, Scenario != "0 - Default"),
+       aes(x = Deviation, y = Scenario, label = round(Deviation, 3))) +
+  geom_segment(aes(y = Scenario, x = Deviation, yend = Scenario, xend = 0)) + # This adds the lines from deviation 0 to the respective dot
+  geom_point(stat = "identity", aes(col = Deviation_Type), size = 15) + # this adds the data points
+  scale_color_manual(values = c("cyan3", "orange"), name = "Deviation") + # alter colors manually and legend title
+  geom_label(color = "black", size = 8, nudge_x = 0.15, fontface = "bold", fill = "white", alpha = 1) + # adding (rounded) values
+  theme_minimal() +
+  theme(axis.title = element_text(size = 30),
+        axis.text = element_text(size = 25),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 30),
+        legend.text = element_text(size = 30),
+        plot.title = element_text(size = 28, face = "bold"),
+  legend.background = element_rect(color = "black", fill = "white", size = 1, linetype = "solid")) +  # Add a box around the legend
+  xlab("Deviation in abundance") +
+  ylab("Sensitivity model") +
+  ggtitle("Deviation in Abundance from the base model between 
+          sensitivity models") 
+Dev_abund
+# save
+#ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_Abundance_Lollipop.png", width = 2099, height = 2099, unit = "px")
+
+
+#### Occupancy ####
+###### Diverging Bar chart #####
+attach(occupancy_after_210)
+ggplot(data = subset(occupancy_after_210, Scenario != "0 - Default"),
+       aes(x = Deviation_Percentage, y = Scenario, fill = Deviation_Type)) +
+  geom_bar(stat = "identity", width = 0.5) + 
+  scale_fill_manual(values = c("orange", "cyan3"), guide = F) +
+  xlab("Deviation from base-model in %") +
+  ylab("Sensitivity model") +
+  ggtitle("Deviation in Occupancy from the base model between 
+          sensitivity models") +
+  theme_minimal()
+# save
+#ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_Occupancy_Bar.png", width = 2099, height = 2099, unit = "px")
+
+##### Diverging lollipop plot #####
+Dev_occ <- ggplot(data = subset(occupancy_after_210, Scenario != "0 - Default"),
+       aes(x = Deviation, y = Scenario, label = round(Deviation, 3))) +
+  geom_segment(aes(y = Scenario, x = Deviation, yend = Scenario, xend = 0)) + # This adds the lines from deviation 0 to the respective dot
+  geom_point(stat = "identity", aes(col = Deviation_Type), size = 15) + # this adds the data points
+  scale_color_manual(values = c("cyan3", "orange"), name = "Deviation") +
+  geom_label(color = "black", size = 8, nudge_x = 0.15, fontface = "bold", fill = "white", alpha = 1) + # adding (rounded) values
+  theme_minimal() +
+  theme(axis.title = element_text(size = 30),
+        axis.text = element_text(size = 25),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 30),
+        legend.text = element_text(size = 30),
+        plot.title = element_text(size = 28, face = "bold"),
+  legend.background = element_rect(color = "black", fill = "white", size = 1, linetype = "solid")) +  # Add a box around the legend
+  xlab("Deviation in occupancy") +
+  ylab("Sensitivity model") +
+  ggtitle("Deviation in Occupancy from the base model between 
+          sensitivity models")
+Dev_occ
+#ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_Occupancy_Lollipop.png", width = 2099, height = 2099, unit = "px")
+
+library(ggpubr)
+ggarrange(Dev_abund, Dev_occ,
+          labels = c("a)", "b)"),
+          font.label = list(size = 40, face = "bold"),
+          common.legend = TRUE,
+          legend = "bottom")
+```
+## Genetics
+### Calculations (run on cluster)
+```{r}
+library(tidyverse)
+library(dplyr)
+library(foreach)
+library(doParallel)
+# Define number of replicates
+num_replicates <- 100
+
+#### Genetic similarity ####
+##### Preparation ####
+library(poppr) # includes package "adegenet" needed for creating genind and genpop objects for dist.genpop()
+library(purrr)
+
+### The following contains the code to create the gen_ind_out_list_sen object needed later onwards. Not needed if gen_ind_out_list_sen.RData already available
+# Initialize an empty list to store genet+ic output for each batch ID
+#gen_out_list <- list()
+
+# Initialize an empty list to store merged genetic and individual output for each batch ID
+#gen_ind_out_list_sen <- list()
+
+# Loop through each batch ID
+#for (batch in batchIDs) {
+# Print status
+# print(paste("Processing gen_ind_out for batch ID:", batch))
+
+# Initialize empty dfs for gen. and ind. output
+#gen_out <- data.frame(matrix(ncol = 120))
+#ind_out <- data.frame(matrix(ncol = 13))
+#gen_out <- data.frame()
+#ind_out <- data.frame()
+# Loop through each replicate
+#for (replicate in 0:(num_replicates - 1)) { # replicates 0-99
+# Read in genetic output
+# gen_out1 <- read.table(paste0("Outputs/Batch", batch, "_Sim1_Land1_Rep", replicate, "_Genetics.txt"), header = TRUE)
+## merge
+#gen_out <- merge(gen_out, gen_out1, all = TRUE)
+#
+## Read in individual output
+#ind_out1 <- read.table(paste0("Outputs/Batch", batch, "_Sim1_Land1_Rep", replicate, "_Inds.txt"), header = TRUE)
+## merge
+#ind_out <- merge(ind_out, ind_out1, all = TRUE)
+#}
+#
+## Exclude individuals with status = 9 (exceeded maximum age)
+#ind_out <- ind_out %>%
+# filter(Status >= 0 & Status <= 8)
+#
+## Merge genetic and individual output
+#gen_ind_out <- gen_out %>%
+# left_join(dplyr::select(ind_out, IndID, Rep, Year, PatchID, Natal_patch), by = c("IndID", "Year", "Rep"))
+#
+## Store the genetic output for the current batch ID in the list
+#gen_out_list[[as.character(batch)]] <- gen_out
+#
+## Store the merged genetic and individual output for the current batch ID in the list
+#gen_ind_out_list_sen[[as.character(batch)]] <- gen_ind_out
+#rm(gen_ind_out, gen_out, ind_out)
+#gc()
+#}
+
+# Save the list containing merged genetic and individual output
+#save(gen_ind_out_list_sen, file = "data/gen_ind_out_list_sen.RData")
+
+load("data/gen_ind_out_list_sen.RData")
+# Initialize empty lists to store the results
+gen_sim_sen_df_list20 <- list()
+gen_sim_sen_df_list210 <- list()
+
+# Initialize master lists to store filtered data for each year across all batches
+master_filtered_data_list <- list()
+
+# Loop through each batch ID
+for (batch in 500:532) {
+  # Print status
+  print(paste("Processing genetic similarity for batch ID:", batch))
+  
+  
+  # Load data for the current batch ID
+  gen_ind_out <- gen_ind_out_list_sen[[as.character(batch)]]
+  
+  # Filter data and drop all rows with PatchID = 0 (currently not in a population)
+  filtered_data <- gen_ind_out[gen_ind_out$PatchID != 0, ]
+  
+  ## Splitting by Year + replicate number
+  # Initialize a list to store filtered data for each year and replicate
+  filtered_data_list <- list()
+  
+  # Loop through each year and replicate number
+  for (year in c(20, 210)) {
+    for (rep in 0:(num_replicates - 1)) { # replicates 0-99
+      # Print the filtering condition
+      cat("Filtering Condition - Batch:", batch, "Year:", year, "Replicate:", rep, "\n")
+      
+      # Filter data for the current year and replicate, excluding NA values
+      filtered_data_year_rep <- filtered_data[!is.na(filtered_data$Year) & 
+                                                !is.na(filtered_data$Rep) &
+                                                filtered_data$Year == year & 
+                                                filtered_data$Rep == rep, ]
+      
+      # Print out the number of rows in the filtered data
+      cat("Batch:", batch, "Year:", year, "Replicate:", rep, "Rows:", nrow(filtered_data_year_rep), "\n")
+      
+      # Check if the filtered data is empty
+      if (nrow(filtered_data_year_rep) == 0) {
+        print(paste("No data found for Batch", batch, "Year", year, "Replicate", rep))
+      }
+      
+      # Create a name for the filtered data based on year and replicate
+      data_name <- paste0("filtered_data", batch, "_", year, "_", rep)
+      
+      # Store the filtered data in the list
+      filtered_data_list[[data_name]] <- filtered_data_year_rep
+    }
+  }
+  
+  # Append the filtered data to the master list
+  master_filtered_data_list <- c(master_filtered_data_list, filtered_data_list)
+  
+  rm(gen_ind_out)
+  rm(filtered_data)
+  gc()
+}
+save(master_filtered_data_list, file = "data/master_filtered_data_list.RData")
+rm(gen_ind_out_list_sen, filtered_data_list)
+gc()
+
+# Now first create a genind object from the filtered data.
+# Initialize lists to store genind objects
+gen_data_list_20 <- list()
+gen_data_list_210 <- list()
+
+# Load the master filtered data list
+load("data/master_filtered_data_list.RData")
+
+# Loop through each batch ID (assuming batch IDs are in the range 500 to 532)
+for (batch in 500:532) {
+  # Loop through each replicate number for Year 20
+  for (rep in 0:(num_replicates - 1)) { # replicates 0-99
+    # Get filtered data for Year 20 and the current replicate
+    filtered_data_rep <- master_filtered_data_list[[paste0("filtered_data", batch, "_20_", rep)]]
+    
+    # Print the progress for Year 20
+    print(paste("Processing batch", batch, "Year 20, replicate", rep))
+    
+    # Check if the filtered data is not empty before proceeding
+    if (nrow(filtered_data_rep) > 0) {
+      # Create genind object for Year 20 and the current replicate
+      gen_data <- df2genind(filtered_data_rep[, c(5, 6)], sep = ":")
+      
+      # Assign population information to genind object
+      pop(gen_data) <- filtered_data_rep$PatchID
+      
+      # Generate the name for the gen_data object
+      gen_data_name <- paste0("gen_data", batch, "_20_", rep)
+      
+      #Store object in list
+      gen_data_list_20 <- c(gen_data_list_20, setNames(list(gen_data), gen_data_name))
+      
+      # Clean up
+      rm(gen_data)
+      gc()
+    }
+  }
+  
+  # Loop through each replicate number for Year 210
+  for (rep in 0:(num_replicates - 1)) { # replicates 0-99
+    # Get filtered data for Year 210 and the current replicate
+    filtered_data_rep <- master_filtered_data_list[[paste0("filtered_data", batch, "_210_", rep)]]
+    
+    # Print the progress for Year 210
+    print(paste("Processing batch", batch, "Year 210, replicate", rep))
+    
+    # Check if the filtered data is not empty before proceeding
+    if (nrow(filtered_data_rep) > 0) {
+      # Create genind object for Year 210 and the current replicate
+      gen_data <- df2genind(filtered_data_rep[, c(5, 6)], sep = ":")
+      
+      # Assign population information to genind object
+      pop(gen_data) <- filtered_data_rep$PatchID
+      
+      # Generate the name for the gen_data object
+      gen_data_name <- paste0("gen_data", batch, "_210_", rep)
+      # Store genind object in the list
+      gen_data_list_210 <- c(gen_data_list_210, setNames(list(gen_data), gen_data_name))
+      
+      # Clean up
+      rm(gen_data)
+      gc()
+    }
+  }
+}
+
+save(gen_data_list_20, file = "data/gen_data_list_20.RData")
+save(gen_data_list_210, file = "data/gen_data_list_210.RData")
+rm(master_filtered_data_list)
+gc()
+
+# Create genpop objects
+ Initialize lists to store genpop objects for each year
+gen_pop_data_list_20 <- list()
+gen_pop_data_list_210 <- list()
+
+# Load data 20
+load("data/gen_data_list_20.RData")
+ Loop through each genind object for Year 20
+for (batch in 500:532) {
+  for (rep in 0:(num_replicates - 1)) {
+    gen_data_name <- paste0("gen_data", batch, "_20_", rep)
+    
+    # Print process
+    print(paste("Processing batch", batch, "Year 20, replicate", rep))
+    
+    if (gen_data_name %in% names(gen_data_list_20)) {
+      gen_data <- gen_data_list_20[[gen_data_name]]
+      
+      # Create genpop object for Year 20
+      gen_pop_data <- genind2genpop(gen_data)
+  
+  # Store genpop object in the list
+  gen_pop_data_list_20 <- c(gen_pop_data_list_20, setNames(list(gen_pop_data), gen_data_name))
+    }
+  }
+}
+save(gen_pop_data_list_20, file = "data/gen_pop_data_list_20.RData")
+
+rm(gen_data_list_20)
+gc()
+
+# Load data 210
+load("data/gen_data_list_210.RData")
+ Loop through each genind object for Year 210
+for (batch in 500:532) {
+  for (rep in 0:(num_replicates - 1)) {
+    gen_data_name <- paste0("gen_data", batch, "_210_", rep)
+    
+    # Print process
+    print(paste("Processing batch", batch, "Year 210, replicate", rep))
+    
+    if (gen_data_name %in% names(gen_data_list_210)) {
+      gen_data <- gen_data_list_210[[gen_data_name]]
+      
+      # Create genpop object for Year 210
+      gen_pop_data <- genind2genpop(gen_data)
+  
+  # Store genpop object in the list
+  gen_pop_data_list_210 <- c(gen_pop_data_list_210, setNames(list(gen_pop_data), gen_data_name))
+    }
+  }
+}
+save(gen_pop_data_list_210, file = "data/gen_pop_data_list_210.RData")
+rm(gen_data_list_210)
+gc()
+#
+###### Calculate genetic Similarity ####
+# Initialize empty list to store genetic similarity matrices for Year 20 & Year 210
+gensim_list_20 <- list()
+gensim_list_210 <- list()
+
+# Load the gen_pop_data_list_20
+load("data/gen_pop_data_list_20.RData")
+
+# Use foreach to parallelize the loop
+gensim_list_20 <- foreach(i = seq_along(gen_pop_data_list_20), .combine = c, .packages = c('adegenet')) %dopar% {
+  # Extract the name and gen_pop_data object
+  name <- names(gen_pop_data_list_20)[i]
+  gen_pop_data <- gen_pop_data_list_20[[i]]
+  
+  # Print process
+  print(paste("Processing", name, "Year 20"))
+  
+  # Calculate Nei's genetic similarity matrix using matrix operations
+  numerator <- gen_pop_data$tab %*% t(gen_pop_data$tab)
+  denominator <- outer(sqrt(rowSums(gen_pop_data$tab^2)), sqrt(rowSums(gen_pop_data$tab^2)), "*")
+  gen_sim_sen_matrix <- numerator / denominator
+  
+  # Store the genetic similarity matrix in the list with the correct name
+  setNames(list(gen_sim_sen_matrix), paste0("gen_sim_sen_", sub("gen_pop_", "", name)))
+}
+
+# Save the results
+save(gensim_list_20, file = "data/gensim_list_20.RData")
+
+# Clean up
+rm(gen_pop_data_list_20)
+gc()
+
+# Year 210
+load("data/gen_pop_data_list_210.RData")
+# Use foreach to parallelize the loop
+gensim_list_210 <- foreach(i = seq_along(gen_pop_data_list_210), .combine = c, .packages = c('adegenet')) %dopar% {
+  # Extract the name and gen_pop_data object
+  name <- names(gen_pop_data_list_210)[i]
+  gen_pop_data <- gen_pop_data_list_210[[i]]
+  
+  # Print process
+  print(paste("Processing", name, "Year 210"))
+  
+  # Calculate Nei's genetic similarity matrix using matrix operations
+  numerator <- gen_pop_data$tab %*% t(gen_pop_data$tab)
+  denominator <- outer(sqrt(rowSums(gen_pop_data$tab^2)), sqrt(rowSums(gen_pop_data$tab^2)), "*")
+  gen_sim_sen_matrix <- numerator / denominator
+  
+  # Store the genetic similarity matrix in the list with the correct name
+  setNames(list(gen_sim_sen_matrix), paste0("gen_sim_sen_", sub("gen_pop_", "", name)))
+}
+
+# Save the results
+save(gensim_list_210, file = "data/gensim_list_210.RData")
+
+# Clean up
+rm(gen_pop_data_list_210)
+gc()
+
+# Loop through each batch ID 
+for (batch in 500:532) {
+  # Print the batch processing status
+  print(paste("Processing batch", batch))
+  
+  # Loop through each genpop object for Year 20
+  for (rep in 0:(num_replicates - 1)) {
+    genpop_name_20 <- paste0("gen_pop_data", batch, "_20_", rep)
+    if (genpop_name_20 %in% names(gen_pop_data_list_20)) {
+      gen_pop_data <- gen_pop_data_list_20[[genpop_name_20]]
+      
+      # Calculate Nei's genetic similarity matrix using matrix operations
+      numerator <- gen_pop_data$tab %*% t(gen_pop_data$tab)
+      denominator <- outer(sqrt(rowSums(gen_pop_data$tab^2)), sqrt(rowSums(gen_pop_data$tab^2)), "*")
+      
+      gen_sim_sen_matrix <- numerator / denominator
+      
+      # Store the genetic similarity matrix in the list for Year 20 with the correct name
+      gensim_list_20 <- c(gensim_list_20, setNames(list(gen_sim_sen_matrix), genpop_name_20))
+      
+      # Create an object named gen_sim_sen + the last parts of the genpop object name
+      assign(paste0("gen_sim_sen_", genpop_name_20), gen_sim_sen_matrix)
+    }
+  }
+  
+  # Loop through each genpop object for Year 210
+  for (rep in 0:(num_replicates - 1)) {
+    genpop_name_210 <- paste0("gen_pop_data", batch, "_210_", rep)
+    if (genpop_name_210 %in% names(gen_pop_data_list_210)) {
+      gen_pop_data <- gen_pop_data_list_210[[genpop_name_210]]
+      
+      # Calculate Nei's genetic similarity matrix using matrix operations
+      numerator <- gen_pop_data$tab %*% t(gen_pop_data$tab)
+      denominator <- outer(sqrt(rowSums(gen_pop_data$tab^2)), sqrt(rowSums(gen_pop_data$tab^2)), "*")
+      
+      gen_sim_sen_matrix <- numerator / denominator
+      
+      # Store the genetic similarity matrix in the list for Year 210 with the correct name
+      gensim_list_210 <- c(gensim_list_210, setNames(list(gen_sim_sen_matrix), genpop_name_210))
+      
+      # Create an object named gen_sim_sen + the last parts of the genpop object name
+      assign(paste0("gen_sim_sen_", genpop_name_210), gen_sim_sen_matrix)
+    }
+  }
+}
+# Save the results
+save(gensim_list_20, file = "data/gensim_list_20.RData")
+rm(gen_pop_data_list_20)
+gc()
+
+save(gensim_list_210, file = "data/gensim_list_210.RData")
+rm(gen_pop_data_list_210)
+gc()
+
+### Transform matrices to data frames
+## First Year
+gen_sim_sen_df20 <- reshape2::melt(gensim_list_20)
+colnames(gen_sim_sen_df20) <- c("Population1", "Population2", "gen_sim", "Model_Year_Replicate")
+
+# Create new columns by extracting the relevant parts from the Model_Year_Replicate column
+gen_sim_sen_df20 <- gen_sim_sen_df20 %>%
+  mutate(Model = as.numeric(sub("gen_sim_sen_gen_data(\\d+)_.*", "\\1", Model_Year_Replicate)),
+         Year = as.numeric(sub("gen_sim_sen_gen_data\\d+_(\\d+)_.*", "\\1", Model_Year_Replicate)),
+         Replicate = as.numeric(sub("gen_sim_sen_gen_data\\d+_\\d+_(\\d+)", "\\1", Model_Year_Replicate)))
+
+## Last Year
+gen_sim_sen_df210 <- reshape2::melt(gensim_list_210)
+colnames(gen_sim_sen_df210) <- c("Population1", "Population2", "gen_sim", "Model_Year_Replicate")
+
+# Create new columns by extracting the relevant parts from the Model_Year_Replicate column
+gen_sim_sen_df210 <- gen_sim_sen_df210 %>%
+  mutate(Model = as.numeric(sub("gen_sim_sen_gen_data(\\d+)_.*", "\\1", Model_Year_Replicate)),
+         Year = as.numeric(sub("gen_sim_sen_gen_data\\d+_(\\d+)_.*", "\\1", Model_Year_Replicate)),
+         Replicate = as.numeric(sub("gen_sim_sen_gen_data\\d+_\\d+_(\\d+)", "\\1", Model_Year_Replicate)))
+
+# Save the lists containing melted data frames
+save(gen_sim_sen_df20, file = "data/gen_sim_sen_df20.RData")
+save(gen_sim_sen_df210, file = "data/gen_sim_sen_df210.RData")
+#### Allelic diversity ####
+
+# Load the gen_ind_out_list_sen data
+load("data/gen_ind_out_list_sen.RData")
+
+# Loop through each object in the list
+for (name in names(gen_ind_out_list_sen)) {
+  # Generate file path
+  file_path <- file.path("data", paste0(name, ".csv"))
+  
+  # Write object to CSV file
+  write.csv(gen_ind_out_list_sen[[name]], file = file_path, row.names = FALSE)
+  
+  # Print progress message
+  cat("Saved", name, "to", file_path, "\n")
+}
+
+rm(gen_ind_out_list_sen)
+
+# Define a named vector mapping PatchIDs to their names
+patch_names <- c(
+  "6" = "Borecka",
+  "4" = "Augustowska",
+  "15" = "Knyszyn",
+  "23" = "Bialowieza",
+  "109" = "Bieszczady",
+  "22" = "West Poland 1",
+  "24" = "West Poland 2",
+  "83" = "Rothaar",
+  "2" = "Romincka",
+  "73" = "Janowskie"
+)
+
+# Define the directory where the CSV files are stored
+data_dir <- "data"
+
+# Get a list of all CSV files in the directory and filter for files named 500 to 532
+csv_files <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE)
+csv_files <- csv_files[basename(csv_files) %in% paste0(500:532, ".csv")]
+
+# Register parallel backend with 30 cores
+registerDoParallel(cores = 32)
+
+# Define patch_names (assuming you have this vector available)
+# patch_names <- c(...) # Add the actual patch names mapping here
+
+# Function to process each file
+process_file <- function(file_path) {
+  batch <- sub(".*/(\\d+)\\.csv", "\\1", file_path)
+  print(paste("Processing batch:", batch))
+  
+  # Read CSV file
+  gen_out_data <- fread(file_path)
+  
+  # Remove columns that contain only NA values
+  gen_out_data <- gen_out_data %>% select_if(~!all(is.na(.)))
+  
+  # Ensure all columns used in pivot_longer have the same type
+  gen_out_data <- gen_out_data %>%
+    mutate(across(starts_with("Chr"), as.character))
+  
+  # Perform data transformations
+  gen_out_long <- gen_out_data %>%
+    dplyr::select(-Species) %>% # exclude species from table
+    pivot_longer(
+      cols = starts_with("Chr"),
+      names_to = "Allele",
+      values_to = "Allele_Value"
+    )
+  
+  summary_gen_out <- gen_out_long %>%
+    group_by(Year, Allele_Value, PatchID) %>%
+    summarise(Frequency = n(), .groups = 'drop')
+  
+  years_frequencies <- summary_gen_out %>%
+    group_by(Year, PatchID) %>%
+    summarise(TotalFrequency = sum(Frequency), .groups = 'drop')
+  
+  summary_gen_out <- summary_gen_out %>%
+    left_join(years_frequencies, by = c("Year", "PatchID")) %>%
+    mutate(Proportion = Frequency / TotalFrequency) %>%
+    dplyr::select(Year, Allele_Value, PatchID, Frequency, Proportion)
+  
+  Allelic_div <- summary_gen_out %>%
+    group_by(Year, PatchID) %>%
+    summarise(A = sum(n_distinct(Allele_Value)) / 58, .groups = 'drop')
+  
+  # Add a new column with the actual names (if patch_names vector is available)
+  if (exists("patch_names")) {
+    Allelic_div <- Allelic_div %>%
+      mutate(Patch_Name = patch_names[as.character(PatchID)])
+  }
+  
+  # Cleanup
+  rm(gen_out_data)
+  gc()
+  
+  # Return the Allelic_div data frame
+  list(batch = batch, Allelic_div = Allelic_div)
+}
+
+# Perform parallel processing in smaller batches
+batch_size <- 5
+num_batches <- ceiling(length(csv_files) / batch_size)
+Allelic_div_list_sen <- list()
+
+for (i in 1:num_batches) {
+  start_idx <- (i - 1) * batch_size + 1
+  end_idx <- min(i * batch_size, length(csv_files))
+  
+  batch_files <- csv_files[start_idx:end_idx]
+  
+  batch_results <- foreach(file_path = batch_files, .combine = 'list', .multicombine = TRUE, .packages = c('dplyr', 'tidyr', 'data.table')) %dopar% {
+    process_file(file_path)
+  }
+  
+  Allelic_div_list_sen <- c(Allelic_div_list_sen, batch_results)
+  
+  # Explicit garbage collection
+  gc()
+}
+
+# Stop the parallel backend
+stopImplicitCluster()
+
+# Print results for verification
+print("Processing complete.")
+# Convert the result to a named list
+Allelic_div_list_sen <- setNames(lapply(Allelic_div_list_sen, `[[`, "Allelic_div"), sapply(Allelic_div_list_sen, `[[`, "batch"))
+
+# Define the PatchID values to keep
+patch_ids_to_keep <- c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73)
+# Filter the rows for each data frame in the list
+for (i in seq_along(Allelic_div_list_sen)) {
+  Allelic_div_list_sen[[i]] <- Allelic_div_list_sen[[i]][Allelic_div_list_sen[[i]]$PatchID %in% patch_ids_to_keep, ]
+}
+
+# Save the list of Allelic_div data frames
+save(Allelic_div_list_sen, file = "data/Allelic_div_list_sen.RData")
+rm(Allelic_div_list_sen)
+gc()
+```
+
+### Compare models Genetic connectivity
+First we extract the desired populations and combine all dfs to one
+```{r}
+# Load the data
+load("data/gen_sim_sen_df20.RData")
+load("data/gen_sim_sen_df210.RData")
+
+# Define the PatchID values to keep
+patch_ids_to_keep <- c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73) 
+
+# Filter the rows for each data frame
+# Year 20
+gen_sim_sen_df20 <- gen_sim_sen_df20[
+  gen_sim_sen_df20$Population1 %in% patch_ids_to_keep & 
+  gen_sim_sen_df20$Population2 %in% patch_ids_to_keep, 
+]
+# Year 210
+gen_sim_sen_df210 <- gen_sim_sen_df210[
+  gen_sim_sen_df210$Population1 %in% patch_ids_to_keep & 
+  gen_sim_sen_df210$Population2 %in% patch_ids_to_keep, 
+]
+
+# Exclude rows where Population 1 = Population 2
+# Year 20
+gen_sim_sen_df20 <- gen_sim_sen_df20[gen_sim_sen_df20$Population1 != gen_sim_sen_df20$Population2, ]
+# Year 210
+gen_sim_sen_df210 <- gen_sim_sen_df210[gen_sim_sen_df210$Population1 != gen_sim_sen_df210$Population2, ]
+
+# Combine the data frames into one
+gen_sim_sen_df_combined <- rbind(gen_sim_sen_df20, gen_sim_sen_df210)
+
+# Calculate average genetic distance across all replicates per scenario and Year
+gen_sim_sen <- gen_sim_sen_df_combined %>%
+  group_by(Model, Year, Population1, Population2) %>%
+  summarize(Avg_Gen_sim = mean(gen_sim)) %>%
+  ungroup()
+
+# Pivot wider to get separate columns for Avg_Gen_sim in Year 20 and Year 210
+gen_sim_sen_df_wide <- gen_sim_sen %>%
+  pivot_wider(
+    id_cols = c("Model", "Population1", "Population2"),
+    names_from = "Year",
+    values_from = "Avg_Gen_sim",
+    names_prefix = "Avg_Gen_sim_"
+  )
+
+# Calculate RELATIVE genetic connectivity after 200 simulation years
+gen_sim_sen_df_wide <- gen_sim_sen_df_wide %>%
+  mutate(Rel_gen_sim_210 = Avg_Gen_sim_210/Avg_Gen_sim_20)
+
+gen_sim_sen_plot <- gen_sim_sen_df_wide %>%
+  group_by(Model) %>%
+  summarize(Rel_gen_sim_210 = mean(Rel_gen_sim_210))
+
+
+# Calculate the deviation percentage
+gen_sim_sen_plot <- gen_sim_sen_plot %>%
+  mutate(Deviation = (Rel_gen_sim_210 / Rel_gen_sim_210[gen_sim_sen_plot$Model==500]))
+
+# Add a new column "Scenario"
+scenario <- c(
+  "0 - Default",
+  "1 - Fecundity +5%",
+  "2 - Fecundity -5%",
+  "3 - Survival S1M +5%",
+  "4 - Survival S1M -5%",
+  "5 - Survival S1F +5%",
+  "6 - Survival S1F -5%",
+  "7 - Survival S2M +5%",
+  "8 - Survival S2M -5%",
+  "9 - Survival S2F +5%",
+  "10 - Survival S2F -5%",
+  "11 - Survival S3M +5%",
+  "12 - Survival S3M -5%",
+  "13 - Survival S3F +5%",
+  "14 - Survival S3F -5%",
+  "15 - Survival S4M +5%",
+  "16 - Survival S4M -5%",
+  "17 - Survival S4F +5%",
+  "18 - Survival S4F -5%",
+  "19 - Survival S5M +5%",
+  "20 - Survival S5M -5%",
+  "21 - Survival S5F +5%",
+  "22 - Survival S5F -5%",
+  "23 - Dispersal S2F +5%",
+  "24 - Dispersal S2F -5%",
+  "25 - Dispersal S2M +5%",
+  "26 - Dispersal S2M -5%",
+  "27 - Dispersal S3F +5%",
+  "28 - Dispersal S3F -5%",
+  "29 - Dispersal S3M +5%",
+  "30 - Dispersal S3M -5%",
+  "31 - Harem size + 10%",
+  "32 - Harem size - 10%"
+)
+gen_sim_sen_plot$Scenario <- factor(scenario, levels = scenario)
+```
+Now we come to the plotting
+```{r}
+gen_sim_sen_plot$Deviation_Type <- ifelse(gen_sim_sen_plot$Deviation < 1, "Negative",
+                                 ifelse(gen_sim_sen_plot$Deviation > 1, "Positive", "No change"))
+
+###### Diverging Bar chart #####
+attach(gen_sim_sen_plot)
+ggplot(data = subset(gen_sim_sen_plot, Scenario != "0 - Default"),
+       aes(x = Deviation, y = Scenario, fill = Deviation_Type)) +
+  geom_bar(stat = "identity", width = 0.5) + 
+  scale_fill_manual(values = c("orange", "cyan3")) +
+  xlab("Deviation in Nei's genetic similarity index from base-model") +
+  ylab("Sensitivity model") +
+  ggtitle("Deviation in genetic similarity from the base-model 
+          between sensitivity models") +
+  theme_minimal()
+# save
+ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_Gen_Sim_Bar.png", width = 2099, height = 2099, unit = "px")
+
+##### Diverging lollipop plot #####
+Dev_gen_sim <- ggplot(data = subset(gen_sim_sen_plot, Scenario != "0 - Default"),
+       aes(x = Deviation, y = Scenario, label = round(Deviation, 3))) + # round to three integers
+  geom_segment(aes(y = Scenario, x = Deviation, yend = Scenario, xend = 0)) + # This adds the lines from deviation 0 to the respective dot
+  geom_point(stat = "identity", aes(col = Deviation_Type), size = 15) + # this adds the data points
+  scale_color_manual(values = c("cyan3", "orange", "grey"), name = "Deviation") +
+  geom_label(color = "black", size = 8, nudge_x = 0.15, fontface = "bold", fill = "white", alpha = 1) + # adding (rounded) values
+  xlab("Relative deviation in Nei's genetic similarity index") +
+  ylab("Sensitivity model") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 30),
+        axis.text = element_text(size = 25),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 30),
+        legend.text = element_text(size = 30),
+        plot.title = element_text(size = 28, face = "bold"),
+        legend.background = element_rect(color = "black", fill = "white", size = 1, linetype = "solid")) +  # Add a box around the legend
+  ggtitle("Relative deviation in genetic connectivity from the 
+          base model between sensitivity models")
+Dev_gen_sim
+  
+ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_Gen_Sim_Lollipop.png", width = 2099, height = 2099, unit = "px")
+
+# summary stats
+summary_stats_gen_sim_sen <- gen_sim_sen_plot %>%
+  select(Scenario, Deviation) %>%
+  group_by(Scenario) %>%
+  do(summarytools::descr(select(., Deviation), stats = "common", transpose = T))
+```
+
+### Compare models Allelic diversity
+```{r}
+# Load the data
+load("data/Allelic_div_list_sen.RData")
+ # Add a "Model" column based on the respective name
+library(purrr)
+Allelic_div_list_sen <- imap(Allelic_div_list_sen, ~ mutate(.x, Model = .y))
+# Combine to one df
+Allelic_div_sen_combined <- Reduce(full_join, Allelic_div_list_sen)
+
+## Add a new column "Scenario"
+scenario <- c(
+  "0 - Default",
+  "1 - Fecundity +5%",
+  "2 - Fecundity -5%",
+  "3 - Survival S1M +5%",
+  "4 - Survival S1M -5%",
+  "5 - Survival S1F +5%",
+  "6 - Survival S1F -5%",
+  "7 - Survival S2M +5%",
+  "8 - Survival S2M -5%",
+  "9 - Survival S2F +5%",
+  "10 - Survival S2F -5%",
+  "11 - Survival S3M +5%",
+  "12 - Survival S3M -5%",
+  "13 - Survival S3F +5%",
+  "14 - Survival S3F -5%",
+  "15 - Survival S4M +5%",
+  "16 - Survival S4M -5%",
+  "17 - Survival S4F +5%",
+  "18 - Survival S4F -5%",
+  "19 - Survival S5M +5%",
+  "20 - Survival S5M -5%",
+  "21 - Survival S5F +5%",
+  "22 - Survival S5F -5%",
+  "23 - Dispersal S2F +5%",
+  "24 - Dispersal S2F -5%",
+  "25 - Dispersal S2M +5%",
+  "26 - Dispersal S2M -5%",
+  "27 - Dispersal S3F +5%",
+  "28 - Dispersal S3F -5%",
+  "29 - Dispersal S3M +5%",
+  "30 - Dispersal S3M -5%",
+  "31 - Harem size + 10%",
+  "32 - Harem size - 10%"
+)
+# Add the "Scenario" column based on the Model column
+Allelic_div_sen_combined <- Allelic_div_sen_combined %>%
+  mutate(
+    Scenario = scenario[as.integer(gsub("^Model ", "", Model)) - 500 + 1]
+  )
+Allelic_div_sen_combined$Scenario <- factor(Allelic_div_sen_combined$Scenario, levels = scenario)
+
+#### Calculate relative A ####
+Allelic_div_sen_combined_relative <- Allelic_div_sen_combined %>%
+  group_by(Scenario, PatchID) %>%
+  mutate(A_Year_20 = A[Year == 20],
+         Relative_A = A / A_Year_20) %>%
+  ungroup() %>%
+  select(-A_Year_20)  # Remove the temporary column
+
+##### Plotting #####
+ggplot(Allelic_div_sen_combined_relative, aes(x = Year, y = Relative_A)) +
+  geom_smooth(aes(colour = Patch_Name, group = Patch_Name)) +
+  geom_smooth(aes(group = 1), colour = "grey30", size = 1.5, linetype = "dashed", method = "lm") +
+  labs(y = "Relative allelic Diversity", colour = "Population") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22),
+        legend.title = element_text(size = 22),
+        legend.text = element_text(size = 20),
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Relative allelic diversity in individual populations over time")
+
+#### Relative deviation from base-model ####
+# Calculate change in A from Year 20 to Year 210
+library(tidyr)
+library(ggrepel)
+Allelic_div_sen_combined_wide <- Allelic_div_sen_combined %>%
+  pivot_wider(names_from = "Year", values_from = "A") %>%
+  mutate(Relative_A = (`210` / `20`))
+
+values_A_bm <- Allelic_div_sen_combined_wide %>%
+  filter(Scenario == "0 - Default") %>%
+  pull("Relative_A")
+Allelic_div_sen_combined_wide <- Allelic_div_sen_combined_wide %>%
+  mutate(A_bm = rep(values_A_bm, length.out = n()))
+# Calculate the deviation (again relative)
+Allelic_div_sen_combined_wide <- Allelic_div_sen_combined_wide %>%
+  mutate(Deviation = ((Relative_A  / A_bm)))
+
+# summary stats
+summary_stats_A_sen <- Allelic_div_sen_combined_wide %>%
+  select(Scenario, Deviation) %>%
+  group_by(Scenario) %>%
+  do(summarytools::descr(select(., Deviation), stats = "common", transpose = T))
+
+# Prepare df for plotting (need mean values across all populations)
+Allelic_div_sen_plot <- summary_stats_A_sen %>%
+  rename(Deviation = Mean)
+
+##### Plotting #####
+# Add deviation type
+Allelic_div_sen_plot$Deviation_Type <- ifelse(Allelic_div_sen_plot$Deviation < 1, "Negative",
+                                 ifelse(Allelic_div_sen_plot$Deviation > 1, "Positive", "No change"))
+###### Diverging lollipop plot ######
+Dev_A <- ggplot(data = subset(Allelic_div_sen_plot, Scenario != "0 - Default"),
+       aes(x = Deviation, y = Scenario, label = round(Deviation), 3)) + # round to three integers
+  geom_segment(aes(y = Scenario, x = Deviation, yend = Scenario, xend = 0)) + # This adds the lines from deviation 0 to the respective dot
+  geom_point(stat = "identity", aes(col = Deviation_Type), size = 15) + # this adds the data points
+  scale_color_manual(values = c("cyan3", "orange", "grey"), name = "Deviation") +
+  geom_label(aes(label = round(Deviation, 3)),
+    color = "black", size = 8, nudge_x = 0.15, fontface = "bold", fill = "white", alpha = 1) + # adding (rounded) values
+    theme_minimal() +
+  theme(axis.title = element_text(size = 30),
+        axis.text = element_text(size = 25),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        #strip.text = element_text(size = 22),
+        legend.title = element_text(size = 30),
+        legend.text = element_text(size = 30),
+        plot.title = element_text(size = 28, face = "bold"),
+        legend.background = element_rect(color = "black", fill = "white", size = 1, linetype = "solid")) +  # Add a box around the legend
+  xlab("Relative deviation in A") +
+  ylab("Sensitivity model") +
+  ggtitle("Relative deviation in allelic diversity from the
+          base model between sensitivity models") 
+Dev_A
+ggsave(filename = "Plots/Sensitivity_Analysis/Deviation_A_Lollipop.png", width = 2099, height = 2099, unit = "px")
+
+library(ggpubr)
+ggarrange(Dev_gen_sim, Dev_A,
+          labels = c("a)", "b)"),
+          font.label = list(size = 40, face = "bold"),
+          common.legend = TRUE,
+          legend = "bottom")
+
+```
+
