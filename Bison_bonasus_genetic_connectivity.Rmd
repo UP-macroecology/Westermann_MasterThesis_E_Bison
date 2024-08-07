@@ -570,7 +570,7 @@ sim_ID <- 1
 sim <- Simulation(Simulation = 1,
                   Replicates = 100,
                   Years = 220,
-                  EnvStoch = 1, # 0=no, 1=activated
+                  EnvStoch = 1, # 0=no, 1=activated (global), 2 = activated (local)
                   EnvStochType = 0, # environmental stochasticity is applied to fecundity
                   std = 0.155, # >0 and <=1.0 | SD of fecundity in Krasinska & Krasinski (2013)
                   ac = 0, # 0-1 temporal autocorrelation coefficient of EnvStoch
