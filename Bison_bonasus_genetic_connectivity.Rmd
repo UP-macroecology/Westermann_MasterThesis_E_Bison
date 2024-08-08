@@ -655,266 +655,8 @@ RunRS(s_translocations5, dirpath)
 #RunRS(s_ecoducts, dirpath)
 ```
 
-# Allelic Diversity
-Calculations on allelic diversity were run on the cluster in a seperate script (Allelic_div_heterozygosity.R)
-## Plotting allelic diversity
-```{r}
-load("data/Allelic_div_list.RData")
-# Names for the data frames
-file_names <- c("Base model","Ecoducts", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5", "Wildlife Corridors")
-# Define a named vector mapping PatchIDs to their names
-patch_names <- c(
-  "6" = "Borecka",
-  "4" = "Augustowska",
-  "15" = "Knyszyn",
-  "23" = "Bialowieza",
-  "109" = "Bieszczady",
-  "22" = "West Poland 1",
-  "24" = "West Poland 2",
-  "83" = "Rothaar",
-  "2" = "Romincka",
-  "73" = "Janowskie"
-)
-# Update Patch_Name in each data frame in the list
-Allelic_div_list <- lapply(Allelic_div_list, function(df) {
-  df %>%
-    mutate(Patch_Name = patch_names[as.character(PatchID)])
-})
-
-# Rename the data frames in the list
-names(Allelic_div_list) <- file_names
-
-# Define the PatchID values to keep
-patch_ids_to_keep <- c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73)
-# Filter the rows for each data frame in the list
-for (i in seq_along(Allelic_div_list)) {
-  Allelic_div_list[[i]] <- Allelic_div_list[[i]][Allelic_div_list[[i]]$PatchID %in% patch_ids_to_keep, ]
-}
-
-# Combine the data frames into one
-Allelic_div_combined <- bind_rows(Allelic_div_list, .id = "Scenario")
-# Reorder "Scenario"
-desired_order <- c("Base model", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5", "Wildlife Corridors", "Ecoducts")
-Allelic_div_combined$Scenario <- factor(Allelic_div_combined$Scenario, levels = desired_order)
-# Overall (not per population)
-ggplot(Allelic_div_combined, aes(x = Year, y = A)) +
-  geom_smooth(method = "loess") +
-  labs(y = "Allelic Diversity") +
-  theme_minimal() +
-  theme(axis.title = element_text(size = 25),
-        axis.text = element_text(size = 20),
-        strip.text = element_text(size = 22), # For facet_wrap text
-        plot.title = element_text(size = 30, face = "bold")) +
-  facet_wrap(~Scenario) +
-  ggtitle("Allelic diversity across all populations over time")
-#ggsave(filename = "Plots/Allelic_div_over_time_overall.png")
-# Plot allelic diversity over time per population
-ggplot(Allelic_div_combined, aes(x = Year, y = A, colour = Patch_Name)) +
-  geom_smooth(method = "loess") +
-  labs(y = "Allelic Diversity", colour = "Population") +
-  theme_minimal() +
-  theme(axis.title = element_text(size = 25),
-        axis.text = element_text(size = 20),
-        strip.text = element_text(size = 22),
-        legend.title = element_text(size = 22),
-        legend.text = element_text(size = 20),
-        plot.title = element_text(size = 30, face = "bold")) +
-  facet_wrap(~Scenario) +
-  ggtitle("Allelic diversity in individual populations over time")
-
-#### Calculate relative A ####
-Allelic_div_combined_relative <- Allelic_div_combined %>%
-  group_by(Scenario, PatchID) %>%
-  mutate(A_Year_20 = A[Year == 20],
-         Relative_A = A / A_Year_20) %>%
-  ungroup() #%>%
-  #select(-A_Year_20)  # Remove the temporary column
-# Plot relative A
-# Overall (not per population)
-ggplot(Allelic_div_combined_relative, aes(x = Year, y = Relative_A)) +
-  geom_smooth(method = "lm") +
-  labs(y = "Allelic Diversity") +
-  theme_minimal() +
-  theme(axis.title = element_text(size = 25),
-        axis.text = element_text(size = 20),
-        strip.text = element_text(size = 22), # For facet_wrap text
-        plot.title = element_text(size = 30, face = "bold")) +
-  facet_wrap(~Scenario) +
-  ggtitle("Allelic diversity across all populations over time")
-#ggsave(filename = "Plots/Allelic_div_over_time_overall.png")
-# Plot allelic diversity over time per population
-ggplot(Allelic_div_combined_relative, aes(x = Year, y = Relative_A)) +
-  geom_smooth(aes(colour = Patch_Name, group = Patch_Name)) +
-  geom_smooth(aes(group = 1), colour = "grey30", size = 1.5, linetype = "dashed", method = "lm") +
-  labs(y = "Relative allelic Diversity", colour = "Population") +
-  theme_minimal() +
-  theme(axis.title = element_text(size = 35),
-        axis.text = element_text(size = 35),
-        axis.title.x = element_text(margin = margin(t = 20)),
-        axis.title.y = element_text(margin = margin(r = 20)),
-        strip.text = element_text(size = 35),
-        legend.title = element_text(size = 35),
-        legend.text = element_text(size = 35),
-        legend.key.size = unit(1.5, "cm"),
-        plot.title = element_text(size = 35, face = "bold")) +
-  facet_wrap(~Scenario) +
-  ggtitle("Relative allelic diversity in individual populations over time")
-# Plot change in A
-#ggplot(Allelic_div_combined_wide, aes(x = Scenario, y = Change_A)) +
- # geom_boxplot() +
-  #labs(x = "Population", y = "Relative change in A") +
-  #scale_fill_discrete(name = "Scenario") +
-  #theme_minimal() +
-  #theme(axis.title = element_text(size = 25),
-   #     axis.text = element_text(size = 20),
-        #strip.text = element_text(size = 22),
-    #    plot.title = element_text(size = 30, face = "bold")) +
-  #ggtitle("Relative change in allelic diversity in each scenario")
-#ggsave(filename = "Plots/Change_All_div.png")
-
-#### Relative A in sim. year 200 ####
-Allelic_div_combined_wide <- Allelic_div_combined %>%
-  pivot_wider(
-    names_from = Year,
-    values_from = A
-  )
-# Calculate relative A in Year 210
-Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
-  mutate(Relative_A = (`210` / `20`))
-
-# Plot relative A after 200 simulation years
-ggplot(Allelic_div_combined_wide, aes(x = Scenario, y = Relative_A)) +
-  geom_boxplot() +
-  labs(x = "Population", y = "Relative A") +
-  #scale_fill_discrete(name = "Scenario") +
-  theme_minimal() +
-  theme(axis.title = element_text(size = 25),
-        axis.text = element_text(size = 20),
-        #strip.text = element_text(size = 22),
-        plot.title = element_text(size = 30, face = "bold")) +
-  ggtitle("Relative allelic diversity after 200 simulation years")
-
-#### Deviation from Base-model ####
-values_A_bm <- Allelic_div_combined_wide %>%
-  filter(Scenario == "Base model") %>%
-  pull("Relative_A")
-Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
-  mutate(A_bm = rep(values_A_bm, length.out = n()))
-# Calculate the deviation percentage (again relative)
-Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
-  mutate(Deviation = ((Relative_A  / A_bm)))
-
-# Plotting
-ggplot(
-  data = subset(Allelic_div_combined_wide, Scenario != "Base model"),
-  aes(x = Scenario, y = Deviation)) +
-  geom_boxplot(fill = "purple") +
-    scale_x_discrete(expand = expansion(mult = c(0, 0))) +
-  labs(x = "Scenario", y = "Relative Deviation in A") +
-  theme_minimal() +
-  theme(axis.title = element_text(size = 35),
-        axis.title.x = element_text(margin = margin(t = 20)),
-        axis.title.y = element_text(margin = margin(r = 20)),
-        axis.text = element_text(size = 35),
-        #strip.text = element_text(size = 22),
-        plot.title = element_text(size = 35, face = "bold")) +
-  ggtitle("Relative deviation in allelic diversity from the base model")
-#ggsave(filename = "Plots/Dev_All_div.png")
-```
-
-## Statistical Analysis Allelic diversity
-```{r}
-#### Relative A after 200 sim. years ####
-# Check distribution 
-hist(Allelic_div_combined_relative$Relative_A)
-ggplot(Allelic_div_combined_relative, aes(x = Relative_A, y = ..density..)) +
-  geom_histogram(alpha = 0.5) +
-  geom_density(color = "red", linewidth = 2) +  # Scaled density curve
-  labs(title = "Histogram with Smoothed Line", x = "Relative A Year 200", y = "Density") +
-  theme_minimal()
-shapiro.test(Allelic_div_combined_relative$Relative_A) # <0.001
-mean(Allelic_div_combined_relative$Relative_A) # 0.9911471
-var(Allelic_div_combined_relative$Relative_A) # 0.002719665
-
-# I have underdispersion, mean > var ...
-lm_log_rel_A <- lm(I(log(Relative_A)) ~ Scenario*Year, data = Allelic_div_combined_relative)
-summary(lm_log_rel_A)
-#Call:
-#lm(formula = I(log(Relative_A)) ~ Scenario * Year, data = Allelic_div_combined_relative)
-#
-#Residuals:
-#      Min        1Q    Median        3Q       Max 
-#-0.097702 -0.034452 -0.009051  0.019417  0.169964 
-#
-#Coefficients:
-#                                  Estimate Std. Error t value Pr(>|t|)   
-#(Intercept)                     -2.788e-04  7.875e-03  -0.035  0.97176   
-#ScenarioTranslocation 1         -4.093e-03  1.114e-02  -0.367  0.71333   
-#ScenarioTranslocation 2          9.686e-03  1.114e-02   0.870  0.38463   
-#ScenarioTranslocation 3          5.979e-03  1.114e-02   0.537  0.59147   
-#ScenarioTranslocation 4          7.973e-03  1.114e-02   0.716  0.47415   
-#ScenarioTranslocation 5          1.422e-02  1.114e-02   1.277  0.20182   
-#ScenarioWildlife Corridors      -8.493e-03  1.114e-02  -0.763  0.44586   
-#ScenarioEcoducts                 2.657e-03  1.114e-02   0.239  0.81147   
-#Year                            -1.745e-04  6.122e-05  -2.851  0.00442 **
-#ScenarioTranslocation 1:Year     8.629e-05  8.657e-05   0.997  0.31905   
-#ScenarioTranslocation 2:Year    -6.778e-07  8.657e-05  -0.008  0.99375   
-#ScenarioTranslocation 3:Year     9.675e-05  8.657e-05   1.118  0.26391   
-#ScenarioTranslocation 4:Year     1.116e-04  8.657e-05   1.289  0.19758   
-#ScenarioTranslocation 5:Year     1.531e-04  8.657e-05   1.769  0.07710 . 
-#ScenarioWildlife Corridors:Year -3.584e-06  8.657e-05  -0.041  0.96698   
-#ScenarioEcoducts:Year            1.664e-05  8.657e-05   0.192  0.84762   
-#---
-#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
-#
-#Residual standard error: 0.04992 on 1584 degrees of freedom
-#Multiple R-squared:  0.07501,	Adjusted R-squared:  0.06625 
-#F-statistic: 8.564 on 15 and 1584 DF,  p-value: < 2.2e-16
-
-
-
-#### Relative deviation from do-nothing scenario ####
-# Check distribution
-Dev_A <- subset(Allelic_div_combined_wide, Scenario != "Do-nothing")
-hist(Dev_A$Deviation) # looks normally distributed
-ggplot(Dev_A, aes(x = Deviation, y = ..density..)) +
-  geom_histogram(alpha = 0.5) +
-  geom_density(color = "red", linewidth = 2) +  # Scaled density curve
-  labs(title = "Histogram with Smoothed Line", x = "Deviation in A from bm", y = "Density") +
-  theme_minimal()
-shapiro.test(Dev_A$Deviation) # 0.2757 --> NORMAL distribution confirmed
-mean(Dev_A$Deviation) # 1.015182
-var(Dev_A$Deviation) # 0.0009371794
-
-lm_dev_A <- lm(Deviation ~ Scenario, data = subset(Allelic_div_combined_wide, Scenario != "Do-nothing"))
-summary(lm_dev_A)
-# Call:
-#lm(formula = Deviation ~ Scenario, data = subset(Allelic_div_combined_wide, Scenario != "Do-nothing"))
-#
-#Residuals:
-#      Min        1Q    Median        3Q       Max 
-#-0.065761 -0.022615  0.002213  0.015132  0.064026
-#
-#Coefficients:
-#                            Estimate Std. Error t value Pr(>|t|)    
-#(Intercept)                 1.012079   0.008965 112.891   <2e-16 ***
-#ScenarioTranslocation 2    -0.006540   0.012679  -0.516   0.6078    
-#ScenarioTranslocation 3     0.013419   0.012679   1.058   0.2939    
-#ScenarioTranslocation 4     0.013335   0.012679   1.052   0.2969    
-#ScenarioTranslocation 5     0.026720   0.012679   2.108   0.0391 *  
-#ScenarioWildlife Corridors -0.016958   0.012679  -1.338   0.1858    
-#ScenarioEcoducts           -0.008257   0.012679  -0.651   0.5173    
-#---
-#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
-#
-#Residual standard error: 0.02835 on 63 degrees of freedom
-#Multiple R-squared:  0.217,	Adjusted R-squared:  0.1424 
-#F-statistic: 2.909 on 6 and 63 DF,  p-value: 0.0144
-```
-
-
 # Genetic connectivity/similarity
-Genetic connectivity (expressed through Nei's genetic similarity index) was calculated for each model/scenario seperately (Gen_analysis_sXX.R). In these scripts I saved the desired output (sXX_gen_sim_df20.RData (first output year) and sXX_gen_sim_df210.RData (last output year))
+Genetic connectivity (expressed through Nei's genetic similarity index) was calculated for each model/scenario seperately (Gen_analysis_sXX.R). In these scripts I saved the desired output (sXX_gen_sim_df20.RData (first output year) and sXX_gen_sim_df210.RData (last output year)). Only after these scripts ran and the processed data is saved can the chunks on genetic connectivity in this script be run.
 ## Preparations
 ```{r}
 ##### Base-model (s9) #####
@@ -1978,6 +1720,262 @@ ggplot() +
 ```
 
 
+# Allelic Diversity
+Calculations on allelic diversity were run on the cluster in a seperate script (Allelic_div.R). Only after the script Allelic_div.R was run and data processed was saved can the chunks on Allelic diversity in this script be run.
+## Plotting allelic diversity
+```{r}
+load("data/Allelic_div_list.RData")
+# Names for the data frames
+file_names <- c("Base model","Ecoducts", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5", "Wildlife Corridors")
+# Define a named vector mapping PatchIDs to their names
+patch_names <- c(
+  "6" = "Borecka",
+  "4" = "Augustowska",
+  "15" = "Knyszyn",
+  "23" = "Bialowieza",
+  "109" = "Bieszczady",
+  "22" = "West Poland 1",
+  "24" = "West Poland 2",
+  "83" = "Rothaar",
+  "2" = "Romincka",
+  "73" = "Janowskie"
+)
+# Update Patch_Name in each data frame in the list
+Allelic_div_list <- lapply(Allelic_div_list, function(df) {
+  df %>%
+    mutate(Patch_Name = patch_names[as.character(PatchID)])
+})
+
+# Rename the data frames in the list
+names(Allelic_div_list) <- file_names
+
+# Define the PatchID values to keep
+patch_ids_to_keep <- c(6, 4, 15, 23, 109, 22, 24, 83, 2, 73)
+# Filter the rows for each data frame in the list
+for (i in seq_along(Allelic_div_list)) {
+  Allelic_div_list[[i]] <- Allelic_div_list[[i]][Allelic_div_list[[i]]$PatchID %in% patch_ids_to_keep, ]
+}
+
+# Combine the data frames into one
+Allelic_div_combined <- bind_rows(Allelic_div_list, .id = "Scenario")
+# Reorder "Scenario"
+desired_order <- c("Base model", "Translocation 1", "Translocation 2", "Translocation 3", "Translocation 4", "Translocation 5", "Wildlife Corridors", "Ecoducts")
+Allelic_div_combined$Scenario <- factor(Allelic_div_combined$Scenario, levels = desired_order)
+# Overall (not per population)
+ggplot(Allelic_div_combined, aes(x = Year, y = A)) +
+  geom_smooth(method = "loess") +
+  labs(y = "Allelic Diversity") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22), # For facet_wrap text
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Allelic diversity across all populations over time")
+#ggsave(filename = "Plots/Allelic_div_over_time_overall.png")
+# Plot allelic diversity over time per population
+ggplot(Allelic_div_combined, aes(x = Year, y = A, colour = Patch_Name)) +
+  geom_smooth(method = "loess") +
+  labs(y = "Allelic Diversity", colour = "Population") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22),
+        legend.title = element_text(size = 22),
+        legend.text = element_text(size = 20),
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Allelic diversity in individual populations over time")
+
+#### Calculate relative A ####
+Allelic_div_combined_relative <- Allelic_div_combined %>%
+  group_by(Scenario, PatchID) %>%
+  mutate(A_Year_20 = A[Year == 20],
+         Relative_A = A / A_Year_20) %>%
+  ungroup() #%>%
+  #select(-A_Year_20)  # Remove the temporary column
+# Plot relative A
+# Overall (not per population)
+ggplot(Allelic_div_combined_relative, aes(x = Year, y = Relative_A)) +
+  geom_smooth(method = "lm") +
+  labs(y = "Allelic Diversity") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        strip.text = element_text(size = 22), # For facet_wrap text
+        plot.title = element_text(size = 30, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Allelic diversity across all populations over time")
+#ggsave(filename = "Plots/Allelic_div_over_time_overall.png")
+# Plot allelic diversity over time per population
+ggplot(Allelic_div_combined_relative, aes(x = Year, y = Relative_A)) +
+  geom_smooth(aes(colour = Patch_Name, group = Patch_Name)) +
+  geom_smooth(aes(group = 1), colour = "grey30", size = 1.5, linetype = "dashed", method = "lm") +
+  labs(y = "Relative allelic Diversity", colour = "Population") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 35),
+        axis.text = element_text(size = 35),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        strip.text = element_text(size = 35),
+        legend.title = element_text(size = 35),
+        legend.text = element_text(size = 35),
+        legend.key.size = unit(1.5, "cm"),
+        plot.title = element_text(size = 35, face = "bold")) +
+  facet_wrap(~Scenario) +
+  ggtitle("Relative allelic diversity in individual populations over time")
+# Plot change in A
+#ggplot(Allelic_div_combined_wide, aes(x = Scenario, y = Change_A)) +
+ # geom_boxplot() +
+  #labs(x = "Population", y = "Relative change in A") +
+  #scale_fill_discrete(name = "Scenario") +
+  #theme_minimal() +
+  #theme(axis.title = element_text(size = 25),
+   #     axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+    #    plot.title = element_text(size = 30, face = "bold")) +
+  #ggtitle("Relative change in allelic diversity in each scenario")
+#ggsave(filename = "Plots/Change_All_div.png")
+
+#### Relative A in sim. year 200 ####
+Allelic_div_combined_wide <- Allelic_div_combined %>%
+  pivot_wider(
+    names_from = Year,
+    values_from = A
+  )
+# Calculate relative A in Year 210
+Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
+  mutate(Relative_A = (`210` / `20`))
+
+# Plot relative A after 200 simulation years
+ggplot(Allelic_div_combined_wide, aes(x = Scenario, y = Relative_A)) +
+  geom_boxplot() +
+  labs(x = "Population", y = "Relative A") +
+  #scale_fill_discrete(name = "Scenario") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20),
+        #strip.text = element_text(size = 22),
+        plot.title = element_text(size = 30, face = "bold")) +
+  ggtitle("Relative allelic diversity after 200 simulation years")
+
+#### Deviation from Base-model ####
+values_A_bm <- Allelic_div_combined_wide %>%
+  filter(Scenario == "Base model") %>%
+  pull("Relative_A")
+Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
+  mutate(A_bm = rep(values_A_bm, length.out = n()))
+# Calculate the deviation percentage (again relative)
+Allelic_div_combined_wide <- Allelic_div_combined_wide %>%
+  mutate(Deviation = ((Relative_A  / A_bm)))
+
+# Plotting
+ggplot(
+  data = subset(Allelic_div_combined_wide, Scenario != "Base model"),
+  aes(x = Scenario, y = Deviation)) +
+  geom_boxplot(fill = "purple") +
+    scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+  labs(x = "Scenario", y = "Relative Deviation in A") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 35),
+        axis.title.x = element_text(margin = margin(t = 20)),
+        axis.title.y = element_text(margin = margin(r = 20)),
+        axis.text = element_text(size = 35),
+        #strip.text = element_text(size = 22),
+        plot.title = element_text(size = 35, face = "bold")) +
+  ggtitle("Relative deviation in allelic diversity from the base model")
+#ggsave(filename = "Plots/Dev_All_div.png")
+```
+
+## Statistical Analysis Allelic diversity
+```{r}
+#### Relative A after 200 sim. years ####
+# Check distribution 
+hist(Allelic_div_combined_relative$Relative_A)
+ggplot(Allelic_div_combined_relative, aes(x = Relative_A, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", linewidth = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Relative A Year 200", y = "Density") +
+  theme_minimal()
+shapiro.test(Allelic_div_combined_relative$Relative_A) # <0.001
+mean(Allelic_div_combined_relative$Relative_A) # 0.9911471
+var(Allelic_div_combined_relative$Relative_A) # 0.002719665
+
+# I have underdispersion, mean > var ...
+lm_log_rel_A <- lm(I(log(Relative_A)) ~ Scenario*Year, data = Allelic_div_combined_relative)
+summary(lm_log_rel_A)
+#Call:
+#lm(formula = I(log(Relative_A)) ~ Scenario * Year, data = Allelic_div_combined_relative)
+#
+#Residuals:
+#      Min        1Q    Median        3Q       Max 
+#-0.097702 -0.034452 -0.009051  0.019417  0.169964 
+#
+#Coefficients:
+#                                  Estimate Std. Error t value Pr(>|t|)   
+#(Intercept)                     -2.788e-04  7.875e-03  -0.035  0.97176   
+#ScenarioTranslocation 1         -4.093e-03  1.114e-02  -0.367  0.71333   
+#ScenarioTranslocation 2          9.686e-03  1.114e-02   0.870  0.38463   
+#ScenarioTranslocation 3          5.979e-03  1.114e-02   0.537  0.59147   
+#ScenarioTranslocation 4          7.973e-03  1.114e-02   0.716  0.47415   
+#ScenarioTranslocation 5          1.422e-02  1.114e-02   1.277  0.20182   
+#ScenarioWildlife Corridors      -8.493e-03  1.114e-02  -0.763  0.44586   
+#ScenarioEcoducts                 2.657e-03  1.114e-02   0.239  0.81147   
+#Year                            -1.745e-04  6.122e-05  -2.851  0.00442 **
+#ScenarioTranslocation 1:Year     8.629e-05  8.657e-05   0.997  0.31905   
+#ScenarioTranslocation 2:Year    -6.778e-07  8.657e-05  -0.008  0.99375   
+#ScenarioTranslocation 3:Year     9.675e-05  8.657e-05   1.118  0.26391   
+#ScenarioTranslocation 4:Year     1.116e-04  8.657e-05   1.289  0.19758   
+#ScenarioTranslocation 5:Year     1.531e-04  8.657e-05   1.769  0.07710 . 
+#ScenarioWildlife Corridors:Year -3.584e-06  8.657e-05  -0.041  0.96698   
+#ScenarioEcoducts:Year            1.664e-05  8.657e-05   0.192  0.84762   
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.04992 on 1584 degrees of freedom
+#Multiple R-squared:  0.07501,	Adjusted R-squared:  0.06625 
+#F-statistic: 8.564 on 15 and 1584 DF,  p-value: < 2.2e-16
+
+
+
+#### Relative deviation from do-nothing scenario ####
+# Check distribution
+Dev_A <- subset(Allelic_div_combined_wide, Scenario != "Do-nothing")
+hist(Dev_A$Deviation) # looks normally distributed
+ggplot(Dev_A, aes(x = Deviation, y = ..density..)) +
+  geom_histogram(alpha = 0.5) +
+  geom_density(color = "red", linewidth = 2) +  # Scaled density curve
+  labs(title = "Histogram with Smoothed Line", x = "Deviation in A from bm", y = "Density") +
+  theme_minimal()
+shapiro.test(Dev_A$Deviation) # 0.2757 --> NORMAL distribution confirmed
+mean(Dev_A$Deviation) # 1.015182
+var(Dev_A$Deviation) # 0.0009371794
+
+lm_dev_A <- lm(Deviation ~ Scenario, data = subset(Allelic_div_combined_wide, Scenario != "Do-nothing"))
+summary(lm_dev_A)
+# Call:
+#lm(formula = Deviation ~ Scenario, data = subset(Allelic_div_combined_wide, Scenario != "Do-nothing"))
+#
+#Residuals:
+#      Min        1Q    Median        3Q       Max 
+#-0.065761 -0.022615  0.002213  0.015132  0.064026
+#
+#Coefficients:
+#                            Estimate Std. Error t value Pr(>|t|)    
+#(Intercept)                 1.012079   0.008965 112.891   <2e-16 ***
+#ScenarioTranslocation 2    -0.006540   0.012679  -0.516   0.6078    
+#ScenarioTranslocation 3     0.013419   0.012679   1.058   0.2939    
+#ScenarioTranslocation 4     0.013335   0.012679   1.052   0.2969    
+#ScenarioTranslocation 5     0.026720   0.012679   2.108   0.0391 *  
+#ScenarioWildlife Corridors -0.016958   0.012679  -1.338   0.1858    
+#ScenarioEcoducts           -0.008257   0.012679  -0.651   0.5173    
+#---
+#Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+#
+#Residual standard error: 0.02835 on 63 degrees of freedom
+#Multiple R-squared:  0.217,	Adjusted R-squared:  0.1424 
+#F-statistic: 2.909 on 6 and 63 DF,  p-value: 0.0144
+```
 # Abundance & Occupancy 
 ## Plots
 ```{r}
