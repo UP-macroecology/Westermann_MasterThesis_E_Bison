@@ -1,8 +1,6 @@
-## This script is for running calculations on Allelic diversity, heterozygosity and genetic similarity on the 
-# ecoc9(z) cluster. 
+## This script is for running genetic similarity on the ecoc9(z) cluster. Files created under Preperation (gen_ind_out_sXX.RData) are further processed for Allelic diversity in a seperate script. 
 #
-##### Allelic diversity + heterozygosity ####
-#---------------------------------------------------------------------------------------------#
+# Ecoducts
 #### Preparation ####
 library(dplyr)
 library(tidyr)
